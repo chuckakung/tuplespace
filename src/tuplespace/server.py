@@ -311,7 +311,13 @@ class TupleSpaceServer:
         return {"status": "ok"}
 
     async def _handle_read(self, request: dict) -> dict:
-        """Handle read operation (non-destructive)."""
+        """Handle read operation (non-destructive).
+
+        sec semantics (Rinda-style):
+            None -> block forever until a match
+            0    -> return immediately (None if no match)
+            >0   -> block up to sec seconds (None on timeout)
+        """
         template = Template(decode_template(request["template"]))
         sec = request.get("sec")
 
@@ -320,11 +326,11 @@ class TupleSpaceServer:
         if entry:
             return {"status": "ok", "result": entry.data}
 
-        # No timeout or zero timeout - return immediately
-        if sec is None or sec == 0:
+        # sec=0 is the only non-blocking path
+        if sec == 0:
             return {"status": "ok", "result": None}
 
-        # Wait for match
+        # Wait for match (sec=None waits forever, sec>0 waits up to sec)
         future = asyncio.get_running_loop().create_future()
         waiter = Waiter(template, future, is_take=False)
         self._waiters.append(waiter)
@@ -337,7 +343,13 @@ class TupleSpaceServer:
             return {"status": "ok", "result": None}
 
     async def _handle_take(self, request: dict) -> dict:
-        """Handle take operation (destructive)."""
+        """Handle take operation (destructive).
+
+        sec semantics (Rinda-style):
+            None -> block forever until a match
+            0    -> return immediately (None if no match)
+            >0   -> block up to sec seconds (None on timeout)
+        """
         template = Template(decode_template(request["template"]))
         sec = request.get("sec")
 
@@ -351,8 +363,8 @@ class TupleSpaceServer:
             logger.debug(f"Take: {entry.data}")
             return {"status": "ok", "result": entry.data}
 
-        # No timeout or zero timeout - return immediately
-        if sec is None or sec == 0:
+        # sec=0 is the only non-blocking path
+        if sec == 0:
             return {"status": "ok", "result": None}
 
         # Wait for match

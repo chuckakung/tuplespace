@@ -96,19 +96,23 @@ class TupleSpaceClient:
 
         Args:
             template: Template to match against (use WILDCARD for any value)
-            sec: Optional timeout in seconds. None = no wait, 0 = immediate.
+            sec: Timeout in seconds. None (default) blocks forever until a match,
+                 0 returns immediately, >0 blocks up to sec seconds.
 
         Returns:
-            Matching tuple or None if timeout/no match
+            Matching tuple, or None if sec was finite and timed out
         """
         if isinstance(template, Template):
             template = template.pattern
 
-        # For blocking reads, set a socket timeout
-        if sec is not None and sec > 0:
+        # Socket timeout: match the wait semantics so a stalled connection
+        # doesn't outlive the caller's intent.
+        if sec is None:
+            self._socket.settimeout(None)  # Block forever
+        elif sec > 0:
             self._socket.settimeout(sec + 5)  # Extra buffer for network
         else:
-            self._socket.settimeout(30)  # Default timeout
+            self._socket.settimeout(30)  # sec=0: response is immediate
 
         try:
             response = self._send_request({
@@ -127,19 +131,21 @@ class TupleSpaceClient:
 
         Args:
             template: Template to match against (use WILDCARD for any value)
-            sec: Optional timeout in seconds. None = no wait, 0 = immediate.
+            sec: Timeout in seconds. None (default) blocks forever until a match,
+                 0 returns immediately, >0 blocks up to sec seconds.
 
         Returns:
-            Matching tuple or None if timeout/no match
+            Matching tuple, or None if sec was finite and timed out
         """
         if isinstance(template, Template):
             template = template.pattern
 
-        # For blocking takes, set a socket timeout
-        if sec is not None and sec > 0:
+        if sec is None:
+            self._socket.settimeout(None)  # Block forever
+        elif sec > 0:
             self._socket.settimeout(sec + 5)  # Extra buffer for network
         else:
-            self._socket.settimeout(30)  # Default timeout
+            self._socket.settimeout(30)  # sec=0: response is immediate
 
         try:
             response = self._send_request({

@@ -215,6 +215,35 @@ class TestBlockingOperations:
         assert result is None
         assert 0.4 < elapsed < 1.5
 
+    def test_default_blocks_forever(self, server, server_port):
+        """sec=None (the default) should block until a tuple appears."""
+        result_holder = [None]
+
+        def reader():
+            with TupleSpaceClient("localhost", server_port) as client:
+                # No sec argument - must block until the writer delivers.
+                result_holder[0] = client.read(("rinda-default",))
+
+        def writer():
+            time.sleep(0.5)
+            with TupleSpaceClient("localhost", server_port) as client:
+                client.write(("rinda-default",))
+
+        reader_thread = threading.Thread(target=reader)
+        writer_thread = threading.Thread(target=writer)
+
+        start = time.time()
+        reader_thread.start()
+        writer_thread.start()
+
+        reader_thread.join(timeout=5)
+        writer_thread.join(timeout=2)
+        elapsed = time.time() - start
+
+        assert result_holder[0] == ("rinda-default",)
+        # Must have actually waited for the writer (~0.5s), not returned None instantly.
+        assert elapsed >= 0.4
+
 
 class TestPersistence:
     """Tests for persistence functionality."""

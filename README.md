@@ -72,11 +72,20 @@ with TupleSpaceClient('localhost', 9999, auth_token='mysecret') as ts:
 
 ### Blocking operations
 
+`read` and `take` follow Rinda's convention for the `sec` argument:
+
+- `sec=None` (default) — block forever until a matching tuple appears
+- `sec=0` — return immediately (`None` if no match)
+- `sec > 0` — block up to `sec` seconds (`None` on timeout)
+
 ```python
-# Block until a matching tuple is available (up to 30 seconds)
+# Block forever until a matching tuple is available
+result = ts.take(("task", WILDCARD, WILDCARD))
+
+# Block up to 30 seconds
 result = ts.take(("task", WILDCARD, WILDCARD), sec=30)
 
-# Non-blocking (return immediately)
+# Non-blocking (return immediately, None if no match)
 result = ts.take(("task", WILDCARD, WILDCARD), sec=0)
 ```
 
@@ -141,8 +150,8 @@ pytest tests/ -v
 
 - `TupleSpaceClient(host, port, auth_token=None)` - Create a client
 - `write(tuple, sec=None)` - Write a tuple (optional expiration in seconds)
-- `read(template, sec=None)` - Non-destructive read (sec=timeout, None=no wait)
-- `take(template, sec=None)` - Destructive read (removes the tuple)
+- `read(template, sec=None)` - Non-destructive read. `sec=None` blocks forever, `0` is immediate, `>0` blocks up to `sec` seconds
+- `take(template, sec=None)` - Destructive read (same `sec` semantics as `read`)
 - `read_all(template)` - Return all matching tuples
 - `size()` - Number of tuples in the space
 - `ping()` - Check server connectivity
