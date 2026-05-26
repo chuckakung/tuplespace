@@ -470,7 +470,7 @@ class TestTupleStoreHeadIndex:
         store = TupleStore()
         entry = TupleEntry(["x", 1], None, 1)
         store.add(entry)
-        assert store._by_head["x"] == [entry]
+        assert list(store._by_head["x"].values()) == [entry]
 
         assert store.remove(entry) is True
         assert "x" not in store._by_head
@@ -489,12 +489,179 @@ class TestTupleStoreHeadIndex:
 
     def test_unhashable_head_skips_index(self):
         store = TupleStore()
-        store.add(TupleEntry([["nested"], 1], None, 1))
-        store.add(TupleEntry(["tag", 2], None, 2))
+        nested = TupleEntry([["nested"], 1], None, 1)
+        tagged = TupleEntry(["tag", 2], None, 2)
+        store.add(nested)
+        store.add(tagged)
 
         # Unhashable head isn't in the index, but wildcard-head lookups still find it
-        assert store._by_head == {"tag": [store._tuples[1]]}
+        assert list(store._by_head.keys()) == ["tag"]
+        assert list(store._by_head["tag"].values()) == [tagged]
         assert store.find_match(Template((WILDCARD, 1))).data == [["nested"], 1]
+
+
+class TestTupleStoreInternals:
+    """Invariants for the dict-backed store, active counter, and expiry heap."""
+
+    def test_active_count_tracks_add_and_remove(self):
+        store = TupleStore()
+        assert store.size() == 0
+
+        e1 = TupleEntry(["a", 1], None, 1)
+        e2 = TupleEntry(["a", 2], None, 2)
+        store.add(e1)
+        store.add(e2)
+        assert store.size() == 2
+
+        store.remove(e1)
+        assert store.size() == 1
+
+        # Removing a non-resident entry must not corrupt the counter.
+        assert store.remove(TupleEntry(["a", 99], None, 999)) is False
+        assert store.size() == 1
+
+    def test_remove_is_idempotent(self):
+        store = TupleStore()
+        e = TupleEntry(["k", 1], None, 1)
+        store.add(e)
+        assert store.remove(e) is True
+        assert store.remove(e) is False
+        assert store.size() == 0
+        assert "k" not in store._by_head
+
+    def test_remove_expired_uses_heap(self):
+        store = TupleStore()
+        now = time.time()
+        # Two expired, one live.
+        store.add(TupleEntry(["x", 1], now - 1, 1))
+        store.add(TupleEntry(["x", 2], now - 1, 2))
+        store.add(TupleEntry(["x", 3], now + 60, 3))
+
+        expired = store.remove_expired()
+        assert {e.entry_id for e in expired} == {1, 2}
+        assert store.size() == 1
+        # The live entry's heap slot remains for future popping; that's fine.
+
+    def test_taken_tuple_does_not_resurface_in_remove_expired(self):
+        """Heap entries for already-taken tuples are skipped lazily."""
+        store = TupleStore()
+        now = time.time()
+        e = TupleEntry(["x", 1], now - 1, 1)
+        store.add(e)
+        # Simulate take before cleanup.
+        store.remove(e)
+        # Heap still has (now-1, 1) but the entry is gone.
+        expired = store.remove_expired()
+        assert expired == []
+        assert store.size() == 0
+
+
+class TestWaiterIndex:
+    """Verify waiter bucketing and FIFO wake order."""
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_concrete_head_waiters_go_into_their_bucket(self):
+        from tuplespace.server import TupleSpaceServer, _OTHER
+
+        async def go():
+            srv = TupleSpaceServer()
+            loop = asyncio.get_running_loop()
+            srv._add_waiter(Template(("task", WILDCARD)), loop.create_future(), is_take=True)
+            srv._add_waiter(Template((WILDCARD, 1)), loop.create_future(), is_take=False)
+            srv._add_waiter(Template(()), loop.create_future(), is_take=False)
+            assert "task" in srv._waiters_by_head
+            assert len(srv._waiters_by_head["task"]) == 1
+            assert len(srv._waiters_other) == 2  # wildcard-head + empty pattern
+
+        self._run(go())
+
+    def test_wake_only_visits_matching_bucket_plus_other(self):
+        """A write with head 'X' must not iterate waiters for head 'Y'."""
+        from tuplespace.server import TupleSpaceServer
+
+        async def go():
+            srv = TupleSpaceServer()
+            loop = asyncio.get_running_loop()
+            srv._entry_counter = 0
+
+            # 1000 waiters bucketed under "noise"; none should be visited.
+            class TrackingTemplate(Template):
+                def __init__(self, pattern):
+                    super().__init__(pattern)
+                    self.calls = 0
+
+                def matches(self, data):
+                    self.calls += 1
+                    return super().matches(data)
+
+            noise_templates = [TrackingTemplate(("noise", WILDCARD)) for _ in range(1000)]
+            for t in noise_templates:
+                srv._add_waiter(t, loop.create_future(), is_take=True)
+
+            real = TrackingTemplate(("target", WILDCARD))
+            real_fut = loop.create_future()
+            srv._add_waiter(real, real_fut, is_take=False)
+
+            # Write a target tuple.
+            await srv._handle_write({"tuple": ["target", 42], "sec": None})
+
+            assert real_fut.done()
+            assert await real_fut == ["target", 42]
+            assert real.calls == 1
+            # No noise-bucket template should have been tested.
+            assert all(t.calls == 0 for t in noise_templates)
+
+        self._run(go())
+
+    def test_fifo_among_takers_preserved(self):
+        """When multiple takers match, the earliest-registered one wins."""
+        from tuplespace.server import TupleSpaceServer
+
+        async def go():
+            srv = TupleSpaceServer()
+            loop = asyncio.get_running_loop()
+            srv._entry_counter = 0
+
+            # Two takers for the same pattern; the first added must win.
+            f1 = loop.create_future()
+            f2 = loop.create_future()
+            srv._add_waiter(Template(("job", WILDCARD)), f1, is_take=True)
+            srv._add_waiter(Template(("job", WILDCARD)), f2, is_take=True)
+
+            await srv._handle_write({"tuple": ["job", "one"], "sec": None})
+            assert f1.done() and not f2.done()
+            assert await f1 == ["job", "one"]
+
+            # Second write goes to the second taker.
+            await srv._handle_write({"tuple": ["job", "two"], "sec": None})
+            assert f2.done()
+            assert await f2 == ["job", "two"]
+
+        self._run(go())
+
+    def test_other_bucket_waiters_also_wake(self):
+        """Wildcard-head waiters live in `_other` and must wake on any write."""
+        from tuplespace.server import TupleSpaceServer
+
+        async def go():
+            srv = TupleSpaceServer()
+            loop = asyncio.get_running_loop()
+            srv._entry_counter = 0
+
+            fut = loop.create_future()
+            srv._add_waiter(Template((WILDCARD, 1)), fut, is_take=False)
+
+            await srv._handle_write({"tuple": ["anything", 1], "sec": None})
+            assert fut.done()
+            assert await fut == ["anything", 1]
+
+        self._run(go())
 
 
 if __name__ == "__main__":
