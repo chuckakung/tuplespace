@@ -4,6 +4,7 @@ Tests for the TupleSpace server and client.
 
 import asyncio
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -662,6 +663,280 @@ class TestWaiterIndex:
             assert await fut == ["anything", 1]
 
         self._run(go())
+
+
+class TestConcurrentClaims:
+    """A tuple must be claimed by exactly one taker.
+
+    These drive two operations at once against a persistence-backed server,
+    which is where `store.remove` is separated from the decision to take by
+    an executor hop. Single-client tests cannot reach these interleavings.
+    """
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def _server(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "concurrent.db")
+        # port=0 lets the OS pick; these tests drive the server object
+        # directly and never open a connection.
+        return TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+
+    def test_concurrent_takes_yield_exactly_one_winner(self):
+        async def go():
+            srv = self._server()
+            await srv.start()
+            try:
+                await srv._process_request({"op": "write", "tuple": ["task", 1]})
+                results = await asyncio.gather(*[
+                    srv._process_request(
+                        {"op": "take", "template": ["task", "__WILDCARD__"], "sec": 0}
+                    )
+                    for _ in range(20)
+                ])
+                winners = [r for r in results if r["result"] is not None]
+                assert len(winners) == 1
+                assert srv.store.size() == 0
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+    def test_read_does_not_see_a_claimed_tuple(self):
+        async def go():
+            srv = self._server()
+            await srv.start()
+            try:
+                await srv._process_request({"op": "write", "tuple": ["lock", "held"]})
+                take, read = await asyncio.gather(
+                    srv._process_request(
+                        {"op": "take", "template": ["lock", "__WILDCARD__"], "sec": 0}
+                    ),
+                    srv._process_request(
+                        {"op": "read", "template": ["lock", "__WILDCARD__"], "sec": 0}
+                    ),
+                )
+                assert take["result"] == ["lock", "held"]
+                assert read["result"] is None
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+    def test_slow_persistence_does_not_destroy_the_tuple(self):
+        """A taker whose timeout expires mid-wake must not lose the tuple."""
+        async def go():
+            srv = self._server()
+            await srv.start()
+            try:
+                real_delete = srv.storage.delete
+
+                def slow_delete(entry_id):
+                    time.sleep(0.3)
+                    return real_delete(entry_id)
+
+                srv.storage.delete = slow_delete
+
+                taker = asyncio.create_task(srv._process_request(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0.2}
+                ))
+                await asyncio.sleep(0.1)
+                write = await srv._process_request({"op": "write", "tuple": ["job", 7]})
+
+                # The write must succeed and the taker must receive the tuple;
+                # it must never vanish from both.
+                assert write["status"] == "ok"
+                assert (await taker)["result"] == ["job", 7]
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+    def test_take_during_wake_path_gets_nothing(self):
+        """While a woken taker's delete is in flight, nobody else may claim it."""
+        async def go():
+            srv = self._server()
+            await srv.start()
+            try:
+                real_delete = srv.storage.delete
+
+                def slow_delete(entry_id):
+                    time.sleep(0.3)
+                    return real_delete(entry_id)
+
+                srv.storage.delete = slow_delete
+
+                parked = asyncio.create_task(srv._process_request(
+                    {"op": "take", "template": ["lock", "__WILDCARD__"], "sec": None}
+                ))
+                await asyncio.sleep(0.05)
+                writer = asyncio.create_task(
+                    srv._process_request({"op": "write", "tuple": ["lock", "held"]})
+                )
+                await asyncio.sleep(0.15)
+
+                second = await srv._process_request(
+                    {"op": "take", "template": ["lock", "__WILDCARD__"], "sec": 0}
+                )
+                assert (await parked)["result"] == ["lock", "held"]
+                assert second["result"] is None
+                await writer
+                assert srv.store.size() == 0
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+
+class TestDisconnectedWaiter:
+    """A client that dies while parked must not consume a tuple."""
+
+    def test_dead_taker_does_not_swallow_a_tuple(self, server, server_port):
+        import json
+        import socket
+        import struct
+
+        # Park a raw socket on a blocking take, then drop it.
+        sock = socket.create_connection(("localhost", server_port))
+        request = json.dumps(
+            {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None}
+        ).encode()
+        sock.sendall(struct.pack(">I", len(request)) + request)
+        time.sleep(0.3)
+        sock.close()
+        time.sleep(0.5)
+
+        # The tuple must survive for a live client.
+        with TupleSpaceClient("localhost", server_port) as ts:
+            ts.write(("job", 42))
+            time.sleep(0.2)
+            assert ts.size() == 1
+            assert ts.take(("job", WILDCARD), sec=0) == ("job", 42)
+
+
+class TestFrameLimit:
+    """An oversized length prefix must be rejected before buffering."""
+
+    def test_oversized_frame_is_refused(self, server, server_port):
+        import socket
+        import struct
+        from tuplespace.server import MAX_FRAME_BYTES
+
+        sock = socket.create_connection(("localhost", server_port))
+        try:
+            # Declare a huge frame without sending the body.
+            sock.sendall(struct.pack(">I", MAX_FRAME_BYTES + 1))
+            sock.settimeout(5)
+            # Server must drop us rather than wait on the bytes.
+            assert sock.recv(1) == b""
+        finally:
+            sock.close()
+
+        # The server itself stays healthy.
+        with TupleSpaceClient("localhost", server_port) as ts:
+            assert ts.ping()
+
+    def test_normal_frames_still_work(self, client):
+        client.write(("under", "limit"))
+        assert client.read(("under", WILDCARD), sec=0) == ("under", "limit")
+
+
+class TestCleanupLoopResilience:
+    """A storage error must not permanently disable expiry cleanup."""
+
+    def test_cleanup_survives_storage_error(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "cleanup.db")
+
+        async def go():
+            srv = TupleSpaceServer(
+                host="localhost", port=0,
+                db_path=db_path, cleanup_interval=0.1,
+            )
+            await srv.start()
+            try:
+                calls = {"n": 0}
+                real_delete = srv.storage.delete
+
+                def flaky_delete(entry_id):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        raise sqlite3.OperationalError("database is locked")
+                    return real_delete(entry_id)
+
+                srv.storage.delete = flaky_delete
+
+                await srv._process_request(
+                    {"op": "write", "tuple": ["ephemeral", 1], "sec": 0.05}
+                )
+                await asyncio.sleep(0.35)  # first sweep raises
+
+                # The loop must still be alive to sweep the next one.
+                assert not srv._cleanup_task.done()
+
+                await srv._process_request(
+                    {"op": "write", "tuple": ["ephemeral", 2], "sec": 0.05}
+                )
+                await asyncio.sleep(0.35)
+                assert srv.store.size() == 0
+            finally:
+                await srv.stop()
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(go())
+        finally:
+            loop.close()
+
+
+class TestAuthComparison:
+    """Auth must still accept valid tokens and reject wrong ones."""
+
+    def _server_with_token(self, port, token):
+        runner = ServerRunner(port)
+        runner.server_kwargs = {"auth_token": token}
+        runner.start()
+        return runner
+
+    def test_correct_token_accepted(self, server_port):
+        runner = self._server_with_token(server_port, "s3cret")
+        try:
+            with TupleSpaceClient("localhost", server_port, auth_token="s3cret") as ts:
+                ts.write(("ok", 1))
+                assert ts.read(("ok", WILDCARD), sec=0) == ("ok", 1)
+        finally:
+            runner.stop()
+
+    def test_wrong_token_rejected(self, server_port):
+        runner = self._server_with_token(server_port, "s3cret")
+        try:
+            with pytest.raises(Exception):
+                with TupleSpaceClient("localhost", server_port, auth_token="wrong") as ts:
+                    ts.write(("nope", 1))
+        finally:
+            runner.stop()
+
+    def test_non_string_token_rejected(self, server_port):
+        """compare_digest raises on non-str input; it must not 500 the server."""
+        import json
+        import socket
+        import struct
+
+        runner = self._server_with_token(server_port, "s3cret")
+        try:
+            sock = socket.create_connection(("localhost", server_port))
+            request = json.dumps({"op": "auth", "token": 12345}).encode()
+            sock.sendall(struct.pack(">I", len(request)) + request)
+            sock.settimeout(5)
+            length = struct.unpack(">I", sock.recv(4))[0]
+            response = json.loads(sock.recv(length))
+            assert response["status"] == "error"
+            sock.close()
+        finally:
+            runner.stop()
 
 
 if __name__ == "__main__":

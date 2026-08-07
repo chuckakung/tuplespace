@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`take` could hand the same tuple to more than one client.** With `--db`
+  persistence, `_handle_take` awaited the SQLite delete between finding a
+  tuple and removing it from the store, so a concurrent `take` (or the write
+  path's waiter wake-up) could claim the same tuple. `store.remove` is now the
+  atomic claim, taken before any `await`, and its return value is honored.
+- **A tuple could be destroyed outright.** If a blocked `take` timed out while
+  `_wake_waiters` was awaiting the SQLite delete, `set_result` raised
+  `InvalidStateError` on the cancelled future after the tuple had already been
+  removed — the taker got nothing, the writer got a spurious error, and the
+  tuple was gone. Persistence is now deferred until after every claim commits.
+- **A client that disconnected while blocked still consumed a tuple.** A
+  parked `read`/`take` never noticed the peer had gone, so the next matching
+  tuple was delivered into the void. Parked waiters now watch for EOF and are
+  dropped without claiming anything.
+- Expired-tuple cleanup no longer stops permanently after a single storage
+  error.
+- SQLite work now runs on one dedicated thread instead of the default executor
+  pool, where commits from multiple threads shared a single connection.
+- The wire protocol now rejects frames larger than 8 MiB instead of buffering
+  whatever length an unauthenticated peer declares.
+- Auth tokens are compared with `hmac.compare_digest`.
+
+### Removed
+
+- `SQLiteBackend.get_next_entry_id()`, which was unused.
+
 ## [0.2.0] - 2026-05-21
 
 ### Changed
