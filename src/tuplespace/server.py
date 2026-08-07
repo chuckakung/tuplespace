@@ -508,15 +508,20 @@ class TupleSpaceServer:
         self._entry_counter += 1
         entry = TupleEntry(tuple_data, expire_time, self._entry_counter)
 
-        # Persist first, then update memory: the tuple becomes visible only
-        # once it is durable, so a taker can never race ahead of its INSERT.
+        # Offer the tuple to parked waiters before it joins the space. A taker
+        # that claims it here consumes a tuple that never entered the store and
+        # never reached disk, so the common producer/consumer handoff costs no
+        # I/O at all instead of an INSERT immediately followed by a DELETE.
+        if self._wake_waiters(entry):
+            logger.debug("Write handed to parked taker: %s", tuple_data)
+            return {"status": "ok"}
+
+        # Nobody took it, so it joins the space. Persist first, then make it
+        # visible: a taker must never be able to race ahead of the INSERT.
         if self.storage:
             await self._db_call(self.storage.save, entry)
 
         self.store.add(entry)
-
-        # Wake waiters
-        await self._wake_waiters(entry)
 
         logger.debug("Write: %s", tuple_data)
         return {"status": "ok"}
@@ -594,20 +599,23 @@ class TupleSpaceServer:
         entries = self.store.find_all(template)
         return {"status": "ok", "result": [e.data for e in entries]}
 
-    async def _wake_waiters(self, entry: TupleEntry) -> None:
-        """Wake up waiters that match the new tuple.
+    def _wake_waiters(self, entry: TupleEntry) -> bool:
+        """Offer a freshly written tuple to parked waiters.
 
-        Only waiters whose template could possibly match are considered:
-        the bucket keyed by the tuple's head element, plus the "other"
-        bucket (wildcard/type/unhashable heads).
+        Returns True if a taker consumed it, meaning the caller must not add
+        it to the store or persist it.
 
-        The whole loop runs without awaiting, so a waiter checked with
-        ``future.done()`` is still pending when its result is set, and the
-        tuple cannot be claimed out from under us mid-scan. Persistence is
-        deferred until every claim has been committed.
+        Called by ``_handle_write`` only, and always *before* the entry joins
+        the store, so there is nothing to remove and nothing on disk to delete.
+        Only waiters whose template could possibly match are considered: the
+        bucket keyed by the tuple's head element, plus the "other" bucket
+        (wildcard/type/unhashable heads).
+
+        Synchronous by design. With no await anywhere in the loop, a waiter
+        that passes the ``future.done()`` check is still pending when its
+        result is set, so a timeout cannot cancel it mid-delivery.
         """
-        take_satisfied = False
-        taken_entry_id: Optional[int] = None
+        taken = False
 
         for waiter in self._waiter_candidates(entry):
             if waiter.future.done():
@@ -618,25 +626,19 @@ class TupleSpaceServer:
                 continue
 
             if waiter.is_take:
-                if take_satisfied:
+                if taken:
                     continue
-                # store.remove is the claim: only hand the tuple to a taker
-                # if we actually own it.
-                if not self.store.remove(entry):
-                    break
                 waiter.future.set_result(entry.data)
                 self._remove_waiter(waiter)
-                take_satisfied = True
-                taken_entry_id = entry.entry_id
+                taken = True
                 logger.debug("Wake taker: %s", entry.data)
             else:
-                # All readers get a copy (even if the tuple was just taken).
+                # All readers get a copy (even if a taker also claimed it).
                 waiter.future.set_result(entry.data)
                 self._remove_waiter(waiter)
                 logger.debug("Wake reader: %s", entry.data)
 
-        if taken_entry_id is not None:
-            await self._persist_delete(taken_entry_id)
+        return taken
 
 
 async def run_server(

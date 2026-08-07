@@ -939,5 +939,145 @@ class TestAuthComparison:
             runner.stop()
 
 
+class TestHandoffSkipsPersistence:
+    """A tuple consumed by a parked taker never enters the store or the db."""
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    @staticmethod
+    def _row_count(db_path):
+        conn = sqlite3.connect(db_path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM tuples").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_handoff_writes_nothing_to_disk(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "handoff.db")
+
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            await srv.start()
+            try:
+                taker = asyncio.create_task(srv._process_request(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None}
+                ))
+                await asyncio.sleep(0.05)
+                await srv._process_request({"op": "write", "tuple": ["job", 1]})
+
+                assert (await taker)["result"] == ["job", 1]
+                # No orphan INSERT left behind, and nothing in the space.
+                assert self._row_count(db_path) == 0
+                assert srv.store.size() == 0
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+    def test_unclaimed_write_is_still_durable(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "durable.db")
+
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            await srv.start()
+            try:
+                await srv._process_request({"op": "write", "tuple": ["kept", 1]})
+                assert self._row_count(db_path) == 1
+            finally:
+                await srv.stop()
+
+            # And it comes back after a restart.
+            srv2 = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            await srv2.start()
+            try:
+                assert srv2.store.size() == 1
+                result = await srv2._process_request(
+                    {"op": "read", "template": ["kept", "__WILDCARD__"], "sec": 0}
+                )
+                assert result["result"] == ["kept", 1]
+            finally:
+                await srv2.stop()
+
+        self._run(go())
+
+    def test_woken_reader_does_not_consume_the_tuple(self):
+        """read is non-destructive, so the tuple must still land on disk."""
+        db_path = os.path.join(tempfile.mkdtemp(), "reader.db")
+
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            await srv.start()
+            try:
+                reader = asyncio.create_task(srv._process_request(
+                    {"op": "read", "template": ["seen", "__WILDCARD__"], "sec": None}
+                ))
+                await asyncio.sleep(0.05)
+                await srv._process_request({"op": "write", "tuple": ["seen", 1]})
+
+                assert (await reader)["result"] == ["seen", 1]
+                assert srv.store.size() == 1
+                assert self._row_count(db_path) == 1
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+    def test_no_duplicates_or_losses_under_load(self):
+        """Many parked takers racing many writers: every tuple taken once."""
+        import collections
+
+        db_path = os.path.join(tempfile.mkdtemp(), "load.db")
+        n_tuples, n_consumers = 200, 80
+
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            await srv.start()
+            try:
+                taken = []
+
+                async def consume():
+                    r = await srv._process_request(
+                        {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 3}
+                    )
+                    if r["result"] is not None:
+                        taken.append(tuple(r["result"]))
+
+                parked = [asyncio.create_task(consume()) for _ in range(n_consumers)]
+                await asyncio.sleep(0.05)
+                writers = [
+                    asyncio.create_task(
+                        srv._process_request({"op": "write", "tuple": ["job", i]})
+                    )
+                    for i in range(n_tuples)
+                ]
+                late = [asyncio.create_task(consume()) for _ in range(n_consumers)]
+                await asyncio.gather(*writers)
+                await asyncio.gather(*parked, *late)
+
+                # Drain the remainder.
+                while True:
+                    r = await srv._process_request(
+                        {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0}
+                    )
+                    if r["result"] is None:
+                        break
+                    taken.append(tuple(r["result"]))
+
+                counts = collections.Counter(taken)
+                assert [t for t, c in counts.items() if c > 1] == []
+                assert set(taken) == {("job", i) for i in range(n_tuples)}
+                assert srv.store.size() == 0
+                assert self._row_count(db_path) == 0
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

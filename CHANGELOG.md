@@ -31,6 +31,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whatever length an unauthenticated peer declares.
 - Auth tokens are compared with `hmac.compare_digest`.
 
+### Changed
+
+- A tuple claimed by an already-parked `take` is now handed over directly and
+  never touches disk, instead of being INSERTed and immediately DELETEd. The
+  producer/consumer handoff drops from ~336us to ~4.5us.
+
+  This narrows one durability edge case. Previously, a crash in the window
+  between the INSERT and the DELETE could leave the tuple recoverable on
+  restart; now a directly-handed tuple is never recoverable. That recovery was
+  accidental rather than designed — it depended on crashing inside a ~90us
+  window, and crashing slightly later lost the tuple anyway. The behavior is
+  now deterministic and matches what the protocol can actually promise, since
+  a taken tuple is never acknowledged by the client.
+
+- `PRAGMA synchronous=NORMAL` on the SQLite connection. Commits are still
+  durable across application crashes (process kill, OOM, redeploy); only power
+  loss or a kernel panic can roll back recent transactions. Median commit
+  latency drops from ~64us to ~16us. The periodic WAL checkpoint cost lands on
+  the dedicated storage thread and never stalls the event loop.
+
 ### Removed
 
 - `SQLiteBackend.get_next_entry_id()`, which was unused.

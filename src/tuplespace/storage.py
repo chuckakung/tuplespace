@@ -32,6 +32,12 @@ class SQLiteBackend:
         """
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
+        # NORMAL skips the per-commit fsync. SQLite guarantees durability
+        # across *application* crashes regardless of this setting; only power
+        # loss or a kernel panic can roll back recent commits. That matches
+        # what this server can promise anyway, since a taken tuple is not
+        # acknowledged by the client.
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS tuples (
                 entry_id INTEGER PRIMARY KEY,
