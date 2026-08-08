@@ -4,7 +4,9 @@ A multi-process coordination system using an asyncio-based server and synchronou
 
 ## Features
 
-- **Asyncio server**: Single-threaded event loop, no locks or deadlocks
+- **Asyncio server**: All tuple state lives on one event loop thread, so
+  operations need no locks. Persistence runs on a single dedicated writer
+  thread; tuple state is never touched from it.
 - **Synchronous clients**: Simple blocking API for easy integration
 - **JSON wire protocol**: Safe, cross-language compatible (no pickle)
 - **Persistence**: SQLite backend for crash recovery

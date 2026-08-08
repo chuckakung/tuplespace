@@ -14,9 +14,10 @@ from .core import TupleEntry
 class SQLiteBackend:
     """SQLite-based persistent storage backend.
 
-    This is a synchronous backend designed for use with the asyncio server.
-    The server calls these methods from the event loop, so they should be fast.
-    For high-throughput scenarios, consider an async upgrade with write buffering.
+    Synchronous by design. The asyncio server drives these methods from a
+    single dedicated thread (see ``TupleSpaceServer._db_executor``); the
+    connection uses ``check_same_thread=False`` and must not be shared across
+    a multi-worker pool, where commits from different threads would interleave.
     """
 
     def __init__(self, db_path: str):
@@ -31,6 +32,12 @@ class SQLiteBackend:
         """
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
+        # NORMAL skips the per-commit fsync. SQLite guarantees durability
+        # across *application* crashes regardless of this setting; only power
+        # loss or a kernel panic can roll back recent commits. That matches
+        # what this server can promise anyway, since a taken tuple is not
+        # acknowledged by the client.
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS tuples (
                 entry_id INTEGER PRIMARY KEY,
@@ -51,12 +58,6 @@ class SQLiteBackend:
             self._next_entry_id = row[0] + 1
 
         return self._next_entry_id
-
-    def get_next_entry_id(self) -> int:
-        """Get and increment the next entry ID."""
-        entry_id = self._next_entry_id
-        self._next_entry_id += 1
-        return entry_id
 
     def save(self, entry: TupleEntry) -> None:
         """Save a tuple entry to SQLite."""
