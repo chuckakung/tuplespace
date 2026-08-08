@@ -94,6 +94,19 @@ class TupleSpaceClient:
     ) -> Optional[tuple]:
         """Read a matching tuple without removing it.
 
+        A returned tuple is a snapshot, not a reservation: another client may
+        take it before this call even returns. Do not use ``read`` to test
+        whether something is still available -- use ``take``, which is the
+        only operation that claims a tuple exclusively.
+
+        In particular, a blocked ``read`` woken by a new write may receive a
+        tuple that a ``take`` claimed at the same instant. That tuple is never
+        added to the space, so ``size()`` never counts it, ``read_all`` never
+        returns it, and a later ``read`` will not find it. This is deliberate:
+        the alternative is leaving a reader blocked even though a matching
+        tuple was written, which would hide the write entirely from anyone
+        observing the space.
+
         Args:
             template: Template to match against (use WILDCARD for any value)
             sec: Timeout in seconds. None (default) blocks forever until a match,

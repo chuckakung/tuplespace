@@ -1027,6 +1027,43 @@ class TestHandoffSkipsPersistence:
 
         self._run(go())
 
+    def test_woken_reader_may_see_a_tuple_that_never_joins_the_space(self):
+        """Locks in the behavior documented under "read is not a reservation".
+
+        A reader and a taker both parked: both receive the tuple, and because
+        the taker claimed it on the way in, it never enters the store or the
+        database.
+        """
+        db_path = os.path.join(tempfile.mkdtemp(), "both.db")
+
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            await srv.start()
+            try:
+                reader = asyncio.create_task(srv._process_request(
+                    {"op": "read", "template": ["job", "__WILDCARD__"], "sec": None}
+                ))
+                taker = asyncio.create_task(srv._process_request(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None}
+                ))
+                await asyncio.sleep(0.05)
+                await srv._process_request({"op": "write", "tuple": ["job", 1]})
+
+                assert (await reader)["result"] == ["job", 1]
+                assert (await taker)["result"] == ["job", 1]
+
+                # ...yet it was never part of the space.
+                assert srv.store.size() == 0
+                assert self._row_count(db_path) == 0
+                read_all = await srv._process_request(
+                    {"op": "read_all", "template": ["job", "__WILDCARD__"]}
+                )
+                assert read_all["result"] == []
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
     def test_no_duplicates_or_losses_under_load(self):
         """Many parked takers racing many writers: every tuple taken once."""
         import collections

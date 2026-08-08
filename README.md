@@ -152,11 +152,42 @@ pytest tests/ -v
 
 - `TupleSpaceClient(host, port, auth_token=None)` - Create a client
 - `write(tuple, sec=None)` - Write a tuple (optional expiration in seconds)
-- `read(template, sec=None)` - Non-destructive read. `sec=None` blocks forever, `0` is immediate, `>0` blocks up to `sec` seconds
+- `read(template, sec=None)` - Non-destructive read. `sec=None` blocks forever, `0` is immediate, `>0` blocks up to `sec` seconds. Returns a snapshot, not a reservation — see [read is not a reservation](#read-is-not-a-reservation)
 - `take(template, sec=None)` - Destructive read (same `sec` semantics as `read`)
 - `read_all(template)` - Return all matching tuples
 - `size()` - Number of tuples in the space
 - `ping()` - Check server connectivity
+
+### read is not a reservation
+
+`read` returns a copy of a matching tuple and leaves it in the space. It does
+not reserve anything — another client may `take` that tuple before your `read`
+even returns. `take` is the only operation that claims a tuple exclusively, so
+a check-then-act pattern like this is always racy:
+
+```python
+if ts.read(("lock",), sec=0):   # someone else can take it right here
+    ts.take(("lock",))          # ...and this returns None
+```
+
+Use `take` directly and check the result instead.
+
+There is one case worth knowing about. A blocked `read` woken by a new write
+may receive a tuple that a `take` claimed at the same instant. That tuple is
+handed straight to the taker and never joins the space, so `size()` never
+counts it, `read_all` never returns it, and a later `read` will not find it:
+
+```python
+# Reader and taker both blocked; a producer writes one tuple.
+reader -> ("job", 1)     # both receive it
+taker  -> ("job", 1)
+ts.size()      # 0
+ts.read_all(("job", WILDCARD))   # []
+```
+
+This is deliberate. The alternative — leaving the reader blocked because a
+taker got there first — would hide the write from anyone observing the space,
+which is worse for the monitoring and logging patterns `read` exists to serve.
 
 ### Pattern Templates
 
