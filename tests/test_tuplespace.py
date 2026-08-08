@@ -1079,5 +1079,102 @@ class TestHandoffSkipsPersistence:
         self._run(go())
 
 
+class TestShutdown:
+    """The server must not deadlock against its own clients on shutdown.
+
+    Since Python 3.12, Server.wait_closed() waits for every handler task to
+    finish. A handler parked on a sec=None waiter, or simply blocked reading
+    the next request, never finishes on its own.
+    """
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_stop_completes_with_a_parked_waiter(self):
+        import json
+        import socket
+        import struct
+
+        port = get_free_port()
+
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=port)
+            await srv.start()
+
+            sock = socket.create_connection(("localhost", port))
+            request = json.dumps(
+                {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None}
+            ).encode()
+            sock.sendall(struct.pack(">I", len(request)) + request)
+            await asyncio.sleep(0.3)
+
+            try:
+                await asyncio.wait_for(srv.stop(), timeout=10)
+            finally:
+                sock.close()
+
+        self._run(go())
+
+    def test_stop_completes_with_an_idle_connection(self):
+        import socket
+
+        port = get_free_port()
+
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=port)
+            await srv.start()
+            sock = socket.create_connection(("localhost", port))  # never sends
+            await asyncio.sleep(0.2)
+            try:
+                await asyncio.wait_for(srv.stop(), timeout=10)
+            finally:
+                sock.close()
+
+        self._run(go())
+
+    def test_cli_exits_on_sigint_with_a_client_connected(self):
+        """The reported symptom: Ctrl-C had to be followed by kill -9."""
+        import json
+        import signal
+        import socket
+        import struct
+        import subprocess
+        import sys
+
+        port = get_free_port()
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "tuplespace", "--port", str(port)],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        sock = None
+        try:
+            time.sleep(2.0)
+            sock = socket.create_connection(("localhost", port))
+            request = json.dumps(
+                {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None}
+            ).encode()
+            sock.sendall(struct.pack(">I", len(request)) + request)
+            time.sleep(0.3)
+
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+            assert proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            pytest.fail("server did not exit on SIGINT with a client connected")
+        finally:
+            if sock is not None:
+                sock.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

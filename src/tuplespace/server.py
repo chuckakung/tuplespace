@@ -7,6 +7,7 @@ import heapq
 import hmac
 import json
 import logging
+import signal
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -202,6 +203,8 @@ class TupleSpaceServer:
         # created with check_same_thread=False and is not safe to share across
         # the default executor's pool, where concurrent commits would interleave.
         self._db_executor: Optional[ThreadPoolExecutor] = None
+        # Live client connections, so shutdown can close them explicitly.
+        self._client_writers: "set[asyncio.StreamWriter]" = set()
 
     # --- waiter index helpers ---
 
@@ -294,14 +297,42 @@ class TupleSpaceServer:
         logger.info(f"TupleSpace server listening on {self.host}:{self.port}")
 
     async def serve_forever(self) -> None:
-        """Serve until cancelled."""
+        """Serve until cancelled.
+
+        Deliberately not ``async with self._server``: that context manager's
+        exit awaits ``wait_closed()`` before the caller's cleanup runs, which
+        deadlocks against live connections. Shutdown belongs to ``stop()``,
+        which releases waiters and closes clients first.
+        """
         if self._server is None:
             await self.start()
-        async with self._server:
-            await self._server.serve_forever()
+        await self._server.serve_forever()
+
+    def _release_waiters(self) -> int:
+        """Cancel every parked waiter so its handler can unwind.
+
+        A handler blocked in ``_wait_for_match`` never returns on its own when
+        ``sec`` is None, and since Python 3.12 ``Server.wait_closed()`` waits
+        for every handler to finish. Without this, shutdown deadlocks against
+        the server's own idle clients.
+        """
+        waiters = list(self._waiters_other.values())
+        for bucket in self._waiters_by_head.values():
+            waiters.extend(bucket.values())
+        for waiter in waiters:
+            if not waiter.future.done():
+                waiter.future.cancel()
+        self._waiters_other.clear()
+        self._waiters_by_head.clear()
+        return len(waiters)
 
     async def stop(self) -> None:
-        """Stop the server."""
+        """Stop the server.
+
+        Parked waiters are released and open connections closed before
+        awaiting ``wait_closed()``; otherwise any connected client -- even an
+        idle one -- keeps the server alive indefinitely.
+        """
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
@@ -309,8 +340,20 @@ class TupleSpaceServer:
             except asyncio.CancelledError:
                 pass
 
+        released = self._release_waiters()
+        if released:
+            logger.debug("Released %d parked waiter(s) for shutdown", released)
+
         if self._server:
             self._server.close()
+
+        # Drop live connections so handlers blocked reading the next request
+        # unwind too. Copied first: each handler discards itself on exit.
+        for writer in list(self._client_writers):
+            if not writer.is_closing():
+                writer.close()
+
+        if self._server:
             await self._server.wait_closed()
 
         if self.storage:
@@ -369,9 +412,12 @@ class TupleSpaceServer:
     ) -> Tuple[Optional[Any], bool]:
         """Park until a tuple matches, the timeout expires, or the peer leaves.
 
-        Returns ``(result, disconnected)``. A parked client sends nothing until
-        it receives a response, so any bytes arriving on ``reader`` mean EOF or
-        a protocol violation; either way the waiter is dead and must not be
+        Returns ``(result, finished)``, where ``finished`` means the connection
+        cannot be used further. The protocol is strictly request/response, so a
+        parked client sends nothing until it gets a reply: anything arriving on
+        ``reader`` is either EOF or a protocol violation. In both cases the
+        connection is done -- for a violation, because the byte just consumed
+        would otherwise desync the next frame -- and the waiter must not be
         allowed to consume a tuple.
         """
         future = waiter.future
@@ -387,12 +433,21 @@ class TupleSpaceServer:
             if watch is not None:
                 watch.cancel()
 
+        # Any completed watch means the stream is finished or out of sync.
+        peer_done = watch is not None and watch.done() and not watch.cancelled()
+
         if future.done():
+            if future.cancelled():
+                # Released by stop(); let the handler unwind.
+                return None, True
+            if peer_done:
+                # We hold a tuple but cannot reply on this connection.
+                return future.result(), True
             return future.result(), False
 
         # Timed out, or the peer vanished. Either way, stop waiting.
         self._remove_waiter(waiter)
-        return None, watch is not None and watch.done() and not watch.cancelled()
+        return None, peer_done
 
     async def _read_message(self, reader: asyncio.StreamReader) -> dict:
         """Read a length-prefixed JSON message.
@@ -422,6 +477,7 @@ class TupleSpaceServer:
         """Handle a client connection."""
         addr = writer.get_extra_info("peername")
         logger.debug(f"Client connected: {addr}")
+        self._client_writers.add(writer)
 
         try:
             # Auth handshake if token is configured
@@ -459,11 +515,17 @@ class TupleSpaceServer:
             logger.warning(f"Oversized frame from {addr}: {e}")
         except (ConnectionResetError, BrokenPipeError):
             logger.debug(f"Connection reset: {addr}")
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception(f"Error handling client {addr}")
         finally:
+            self._client_writers.discard(writer)
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, asyncio.CancelledError):
+                pass
 
     async def _process_request(
         self, request: dict, reader: Optional[asyncio.StreamReader] = None
@@ -647,13 +709,38 @@ async def run_server(
     db_path: Optional[str] = None,
     auth_token: Optional[str] = None,
 ) -> None:
-    """Run the TupleSpace server."""
+    """Run the TupleSpace server until SIGINT or SIGTERM.
+
+    Shutdown is driven by an explicit signal handler rather than by letting
+    KeyboardInterrupt unwind through ``asyncio.run``. Relying on that unwind
+    deadlocks whenever a client is connected, and it ignores SIGTERM entirely,
+    which is what container runtimes and init systems actually send.
+    """
     server = TupleSpaceServer(host=host, port=port, db_path=db_path, auth_token=auth_token)
     await server.start()
 
+    loop = asyncio.get_running_loop()
+    stopped = loop.create_future()
+
+    def request_stop(signame: str) -> None:
+        logger.info("Received %s, shutting down", signame)
+        if not stopped.done():
+            stopped.set_result(None)
+
+    installed = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_stop, sig.name)
+            installed.append(sig)
+        except (NotImplementedError, AttributeError):
+            # add_signal_handler is unavailable on Windows proactor loops.
+            pass
+
     try:
-        await server.serve_forever()
+        await stopped
     except asyncio.CancelledError:
         pass
     finally:
+        for sig in installed:
+            loop.remove_signal_handler(sig)
         await server.stop()

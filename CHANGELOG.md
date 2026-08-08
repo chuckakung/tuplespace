@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parked `read`/`take` never noticed the peer had gone, so the next matching
   tuple was delivered into the void. Parked waiters now watch for EOF and are
   dropped without claiming anything.
+- **The server could not be shut down while any client was connected.**
+  `python -m tuplespace` ignored Ctrl-C and had to be `kill -9`ed. Since
+  Python 3.12, `Server.wait_closed()` waits for every handler task to finish,
+  and a handler parked on a `sec=None` waiter — the 0.2.0 default — or simply
+  blocked reading the next request never finishes. `stop()` now releases
+  parked waiters and closes live connections before awaiting `wait_closed()`,
+  and `serve_forever()` no longer wraps the server in `async with`, whose exit
+  awaited `wait_closed()` before the caller's cleanup could run.
+- **SIGTERM was not handled at all**, so container runtimes and init systems
+  got no graceful shutdown. `run_server` now installs explicit SIGINT and
+  SIGTERM handlers instead of relying on KeyboardInterrupt unwinding through
+  `asyncio.run`, which deadlocked whenever a client was connected.
+- A parked client that sent data mid-request had that byte consumed by the
+  disconnect watcher and silently desynced the next frame. Stray data is now
+  treated as a protocol violation that ends the connection.
 - Expired-tuple cleanup no longer stops permanently after a single storage
   error.
 - SQLite work now runs on one dedicated thread instead of the default executor
