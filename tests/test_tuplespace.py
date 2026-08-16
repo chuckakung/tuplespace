@@ -247,7 +247,7 @@ class TestBlockingOperations:
 
 
 class TestPersistence:
-    """Tests for persistence functionality."""
+    """Tests for snapshot load/store across process lifetime."""
 
     def test_persistence_across_restart(self):
         port = get_free_port()
@@ -291,8 +291,10 @@ class TestPersistence:
         db_path = os.path.join(tempfile.mkdtemp(), "purge.db")
         seed = SQLiteBackend(db_path)
         seed.initialize()
-        seed.save(TupleEntry(["stale", 1], time.time() - 60, 1))
-        seed.save(TupleEntry(["fresh", 2], None, 2))
+        seed.save_snapshot([
+            TupleEntry(["stale", 1], time.time() - 60, 1),
+            TupleEntry(["fresh", 2], None, 2),
+        ])
         seed.close()
 
         async def go():
@@ -563,6 +565,17 @@ class TestTupleStoreInternals:
         assert store.size() == 0
         assert "k" not in store._by_head
 
+    def test_snapshot_is_a_point_in_time_copy(self):
+        store = TupleStore()
+        e1 = TupleEntry(["a", 1], None, 1)
+        e2 = TupleEntry(["b", 2], None, 2)
+        store.add(e1)
+        store.add(e2)
+        frozen = store.snapshot()
+        store.remove(e1)
+        assert {e.entry_id for e in frozen} == {1, 2}
+        assert store.size() == 1
+
     def test_remove_expired_uses_heap(self):
         store = TupleStore()
         now = time.time()
@@ -699,12 +712,7 @@ class TestWaiterIndex:
 
 
 class TestConcurrentClaims:
-    """A tuple must be claimed by exactly one taker.
-
-    These drive two operations at once against a persistence-backed server,
-    which is where `store.remove` is separated from the decision to take by
-    an executor hop. Single-client tests cannot reach these interleavings.
-    """
+    """A tuple must be claimed by exactly one taker."""
 
     def _run(self, coro):
         loop = asyncio.new_event_loop()
@@ -714,10 +722,7 @@ class TestConcurrentClaims:
             loop.close()
 
     def _server(self):
-        db_path = os.path.join(tempfile.mkdtemp(), "concurrent.db")
-        # port=0 lets the OS pick; these tests drive the server object
-        # directly and never open a connection.
-        return TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+        return TupleSpaceServer(host="localhost", port=0)
 
     def test_concurrent_takes_yield_exactly_one_winner(self):
         async def go():
@@ -760,109 +765,24 @@ class TestConcurrentClaims:
 
         self._run(go())
 
-    def test_slow_persistence_does_not_destroy_the_tuple(self):
-        """A taker whose timeout expires mid-wake must not lose the tuple."""
-        async def go():
-            srv = self._server()
-            await srv.start()
-            try:
-                real_delete = srv.storage.delete
-
-                def slow_delete(entry_id):
-                    time.sleep(0.3)
-                    return real_delete(entry_id)
-
-                srv.storage.delete = slow_delete
-
-                taker = asyncio.create_task(srv._process_request(
-                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0.2}
-                ))
-                await asyncio.sleep(0.1)
-                write = await srv._process_request({"op": "write", "tuple": ["job", 7]})
-
-                # The write must succeed and the taker must receive the tuple;
-                # it must never vanish from both.
-                assert write["status"] == "ok"
-                assert (await taker)["result"] == ["job", 7]
-            finally:
-                await srv.stop()
-
-        self._run(go())
-
     def test_take_during_wake_path_gets_nothing(self):
-        """While a woken taker's delete is in flight, nobody else may claim it."""
+        """Once a parked taker is handed the tuple, nobody else may claim it."""
         async def go():
             srv = self._server()
             await srv.start()
             try:
-                real_delete = srv.storage.delete
-
-                def slow_delete(entry_id):
-                    time.sleep(0.3)
-                    return real_delete(entry_id)
-
-                srv.storage.delete = slow_delete
-
                 parked = asyncio.create_task(srv._process_request(
                     {"op": "take", "template": ["lock", "__WILDCARD__"], "sec": None}
                 ))
                 await asyncio.sleep(0.05)
-                writer = asyncio.create_task(
-                    srv._process_request({"op": "write", "tuple": ["lock", "held"]})
-                )
-                await asyncio.sleep(0.15)
+                await srv._process_request({"op": "write", "tuple": ["lock", "held"]})
 
                 second = await srv._process_request(
                     {"op": "take", "template": ["lock", "__WILDCARD__"], "sec": 0}
                 )
                 assert (await parked)["result"] == ["lock", "held"]
                 assert second["result"] is None
-                await writer
                 assert srv.store.size() == 0
-            finally:
-                await srv.stop()
-
-        self._run(go())
-
-    def test_take_arriving_during_persist_is_not_stranded(self):
-        """A take that shows up mid-INSERT must not miss the tuple entirely.
-
-        The wake-up for a write happens once. A taker that arrives after it
-        used to be too late for the offer and too early to find the tuple in
-        the store, so it parked on a write that had already gone by -- and
-        with the default ``sec=None`` it would park forever.
-        """
-        async def go():
-            srv = self._server()
-            await srv.start()
-            try:
-                real_save = srv.storage.save
-
-                def slow_save(entry):
-                    time.sleep(0.3)
-                    return real_save(entry)
-
-                srv.storage.save = slow_save
-
-                # Nobody is waiting, so this write goes to disk -- slowly.
-                writer = asyncio.create_task(
-                    srv._process_request({"op": "write", "tuple": ["job", 7]})
-                )
-                await asyncio.sleep(0.1)
-
-                # The taker arrives while that INSERT is still in flight.
-                taker = await srv._process_request(
-                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0.5}
-                )
-                assert taker["result"] == ["job", 7]
-
-                await writer
-                assert srv.store.size() == 0
-
-                # The taker's DELETE was enqueued behind the write's INSERT on
-                # the single storage thread, so the two land in order and the
-                # tuple must not survive on disk.
-                assert await srv._db_call(srv.storage.load_all) == []
             finally:
                 await srv.stop()
 
@@ -999,35 +919,31 @@ class TestFrameLimit:
 
 
 class TestCleanupLoopResilience:
-    """A storage error must not permanently disable expiry cleanup."""
+    """A sweep error must not permanently disable expiry cleanup."""
 
-    def test_cleanup_survives_storage_error(self):
-        db_path = os.path.join(tempfile.mkdtemp(), "cleanup.db")
-
+    def test_cleanup_survives_remove_error(self):
         async def go():
             srv = TupleSpaceServer(
-                host="localhost", port=0,
-                db_path=db_path, cleanup_interval=0.1,
+                host="localhost", port=0, cleanup_interval=0.1,
             )
             await srv.start()
             try:
                 calls = {"n": 0}
-                real_delete = srv.storage.delete
+                real_remove = srv.store.remove_expired
 
-                def flaky_delete(entry_id):
+                def flaky_remove():
                     calls["n"] += 1
                     if calls["n"] == 1:
-                        raise sqlite3.OperationalError("database is locked")
-                    return real_delete(entry_id)
+                        raise RuntimeError("sweep failed")
+                    return real_remove()
 
-                srv.storage.delete = flaky_delete
+                srv.store.remove_expired = flaky_remove
 
                 await srv._process_request(
                     {"op": "write", "tuple": ["ephemeral", 1], "sec": 0.05}
                 )
                 await asyncio.sleep(0.35)  # first sweep raises
 
-                # The loop must still be alive to sweep the next one.
                 assert not srv._cleanup_task.done()
 
                 await srv._process_request(
@@ -1092,8 +1008,8 @@ class TestAuthComparison:
             runner.stop()
 
 
-class TestHandoffSkipsPersistence:
-    """A tuple consumed by a parked taker never enters the store or the db."""
+class TestSnapshotPersistence:
+    """--db is a snapshot, not a per-write commit."""
 
     def _run(self, coro):
         loop = asyncio.new_event_loop()
@@ -1110,42 +1026,41 @@ class TestHandoffSkipsPersistence:
         finally:
             conn.close()
 
-    def test_handoff_writes_nothing_to_disk(self):
-        db_path = os.path.join(tempfile.mkdtemp(), "handoff.db")
+    def test_write_does_not_touch_disk(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "nodisk.db")
 
         async def go():
-            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            srv = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
             await srv.start()
             try:
-                taker = asyncio.create_task(srv._process_request(
-                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None}
-                ))
-                await asyncio.sleep(0.05)
-                await srv._process_request({"op": "write", "tuple": ["job", 1]})
-
-                assert (await taker)["result"] == ["job", 1]
-                # No orphan INSERT left behind, and nothing in the space.
+                await srv._process_request({"op": "write", "tuple": ["kept", 1]})
+                assert srv.store.size() == 1
                 assert self._row_count(db_path) == 0
-                assert srv.store.size() == 0
             finally:
                 await srv.stop()
 
         self._run(go())
 
-    def test_unclaimed_write_is_still_durable(self):
+    def test_clean_stop_keeps_unclaimed_writes(self):
         db_path = os.path.join(tempfile.mkdtemp(), "durable.db")
 
         async def go():
-            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            srv = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
             await srv.start()
             try:
                 await srv._process_request({"op": "write", "tuple": ["kept", 1]})
-                assert self._row_count(db_path) == 1
             finally:
                 await srv.stop()
 
-            # And it comes back after a restart.
-            srv2 = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            assert self._row_count(db_path) == 1
+
+            srv2 = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
             await srv2.start()
             try:
                 assert srv2.store.size() == 1
@@ -1158,12 +1073,84 @@ class TestHandoffSkipsPersistence:
 
         self._run(go())
 
+    def test_periodic_snapshot_lands_without_stop(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "periodic.db")
+
+        async def go():
+            srv = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0.1,
+            )
+            await srv.start()
+            try:
+                await srv._process_request({"op": "write", "tuple": ["tick", 1]})
+                await asyncio.sleep(0.35)
+                assert self._row_count(db_path) == 1
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+    def test_take_then_snapshot_does_not_resurrect(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "taken.db")
+
+        async def go():
+            srv = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
+            await srv.start()
+            try:
+                await srv._process_request({"op": "write", "tuple": ["job", 1]})
+                await srv._snapshot()
+                taken = await srv._process_request(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0}
+                )
+                assert taken["result"] == ["job", 1]
+                await srv._snapshot()
+            finally:
+                await srv.stop()
+
+            srv2 = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
+            await srv2.start()
+            try:
+                assert srv2.store.size() == 0
+            finally:
+                await srv2.stop()
+
+        self._run(go())
+
+    def test_handoff_leaves_the_space_empty(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "handoff.db")
+
+        async def go():
+            srv = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
+            await srv.start()
+            try:
+                taker = asyncio.create_task(srv._process_request(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None}
+                ))
+                await asyncio.sleep(0.05)
+                await srv._process_request({"op": "write", "tuple": ["job", 1]})
+
+                assert (await taker)["result"] == ["job", 1]
+                assert srv.store.size() == 0
+            finally:
+                await srv.stop()
+
+            assert self._row_count(db_path) == 0
+
+        self._run(go())
+
     def test_woken_reader_does_not_consume_the_tuple(self):
-        """read is non-destructive, so the tuple must still land on disk."""
         db_path = os.path.join(tempfile.mkdtemp(), "reader.db")
 
         async def go():
-            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            srv = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
             await srv.start()
             try:
                 reader = asyncio.create_task(srv._process_request(
@@ -1174,23 +1161,17 @@ class TestHandoffSkipsPersistence:
 
                 assert (await reader)["result"] == ["seen", 1]
                 assert srv.store.size() == 1
-                assert self._row_count(db_path) == 1
             finally:
                 await srv.stop()
+
+            assert self._row_count(db_path) == 1
 
         self._run(go())
 
     def test_woken_reader_may_see_a_tuple_that_never_joins_the_space(self):
-        """Locks in the behavior documented under "read is not a reservation".
-
-        A reader and a taker both parked: both receive the tuple, and because
-        the taker claimed it on the way in, it never enters the store or the
-        database.
-        """
-        db_path = os.path.join(tempfile.mkdtemp(), "both.db")
-
+        """Locks in the behavior documented under "read is not a reservation"."""
         async def go():
-            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            srv = TupleSpaceServer(host="localhost", port=0)
             await srv.start()
             try:
                 reader = asyncio.create_task(srv._process_request(
@@ -1204,10 +1185,7 @@ class TestHandoffSkipsPersistence:
 
                 assert (await reader)["result"] == ["job", 1]
                 assert (await taker)["result"] == ["job", 1]
-
-                # ...yet it was never part of the space.
                 assert srv.store.size() == 0
-                assert self._row_count(db_path) == 0
                 read_all = await srv._process_request(
                     {"op": "read_all", "template": ["job", "__WILDCARD__"]}
                 )
@@ -1217,15 +1195,42 @@ class TestHandoffSkipsPersistence:
 
         self._run(go())
 
+    def test_snapshot_loop_survives_storage_error(self):
+        db_path = os.path.join(tempfile.mkdtemp(), "snapfail.db")
+
+        async def go():
+            srv = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0.1,
+            )
+            await srv.start()
+            try:
+                calls = {"n": 0}
+                real = srv.storage.save_snapshot
+
+                def flaky(entries):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        raise sqlite3.OperationalError("database is locked")
+                    return real(entries)
+
+                srv.storage.save_snapshot = flaky
+                await srv._process_request({"op": "write", "tuple": ["ok", 1]})
+                await asyncio.sleep(0.35)
+                assert not srv._snapshot_task.done()
+                assert self._row_count(db_path) == 1
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
     def test_no_duplicates_or_losses_under_load(self):
         """Many parked takers racing many writers: every tuple taken once."""
         import collections
 
-        db_path = os.path.join(tempfile.mkdtemp(), "load.db")
         n_tuples, n_consumers = 200, 80
 
         async def go():
-            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            srv = TupleSpaceServer(host="localhost", port=0)
             await srv.start()
             try:
                 taken = []
@@ -1249,7 +1254,6 @@ class TestHandoffSkipsPersistence:
                 await asyncio.gather(*writers)
                 await asyncio.gather(*parked, *late)
 
-                # Drain the remainder.
                 while True:
                     r = await srv._process_request(
                         {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0}
@@ -1262,7 +1266,6 @@ class TestHandoffSkipsPersistence:
                 assert [t for t, c in counts.items() if c > 1] == []
                 assert set(taken) == {("job", i) for i in range(n_tuples)}
                 assert srv.store.size() == 0
-                assert self._row_count(db_path) == 0
             finally:
                 await srv.stop()
 
