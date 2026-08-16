@@ -284,6 +284,39 @@ class TestPersistence:
         finally:
             os.unlink(db_path)
 
+    def test_rows_that_expired_while_down_are_purged_at_startup(self):
+        """load_all filters expired rows; nothing ever deleted them."""
+        from tuplespace.storage import SQLiteBackend
+
+        db_path = os.path.join(tempfile.mkdtemp(), "purge.db")
+        seed = SQLiteBackend(db_path)
+        seed.initialize()
+        seed.save(TupleEntry(["stale", 1], time.time() - 60, 1))
+        seed.save(TupleEntry(["fresh", 2], None, 2))
+        seed.close()
+
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            await srv.start()
+            try:
+                assert srv.store.size() == 1
+            finally:
+                await srv.stop()
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(go())
+        finally:
+            loop.close()
+
+        # The expired row is gone from disk, not merely filtered out of memory.
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = [r[0] for r in conn.execute("SELECT entry_id FROM tuples")]
+        finally:
+            conn.close()
+        assert rows == [2]
+
 
 class TestMultipleClients:
     """Tests for multiple concurrent clients."""
@@ -791,9 +824,129 @@ class TestConcurrentClaims:
 
         self._run(go())
 
+    def test_take_arriving_during_persist_is_not_stranded(self):
+        """A take that shows up mid-INSERT must not miss the tuple entirely.
+
+        The wake-up for a write happens once. A taker that arrives after it
+        used to be too late for the offer and too early to find the tuple in
+        the store, so it parked on a write that had already gone by -- and
+        with the default ``sec=None`` it would park forever.
+        """
+        async def go():
+            srv = self._server()
+            await srv.start()
+            try:
+                real_save = srv.storage.save
+
+                def slow_save(entry):
+                    time.sleep(0.3)
+                    return real_save(entry)
+
+                srv.storage.save = slow_save
+
+                # Nobody is waiting, so this write goes to disk -- slowly.
+                writer = asyncio.create_task(
+                    srv._process_request({"op": "write", "tuple": ["job", 7]})
+                )
+                await asyncio.sleep(0.1)
+
+                # The taker arrives while that INSERT is still in flight.
+                taker = await srv._process_request(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0.5}
+                )
+                assert taker["result"] == ["job", 7]
+
+                await writer
+                assert srv.store.size() == 0
+
+                # The taker's DELETE was enqueued behind the write's INSERT on
+                # the single storage thread, so the two land in order and the
+                # tuple must not survive on disk.
+                assert await srv._db_call(srv.storage.load_all) == []
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
 
 class TestDisconnectedWaiter:
     """A client that dies while parked must not consume a tuple."""
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_undelivered_claim_goes_back_into_the_space(self):
+        """A tuple claimed for a peer that vanished must not be destroyed.
+
+        The reply is written only after the handler returns, so when the peer
+        is already gone the server knows for certain the tuple never left --
+        it can be put back with no risk of handing it out twice.
+        """
+        async def go():
+            db_path = os.path.join(tempfile.mkdtemp(), "undelivered.db")
+            srv = TupleSpaceServer(host="localhost", port=0, db_path=db_path)
+            await srv.start()
+            try:
+                # Park a taker on a reader we control.
+                reader = asyncio.StreamReader()
+                taker = asyncio.create_task(srv._handle_take(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None},
+                    reader,
+                ))
+                await asyncio.sleep(0.05)
+
+                # Claim the tuple and kill the peer with nothing awaited in
+                # between, so the handler wakes to find both at once.
+                write = asyncio.create_task(
+                    srv._process_request({"op": "write", "tuple": ["job", 7], "sec": 60})
+                )
+                reader.feed_eof()
+                await write
+
+                from tuplespace.server import _CLIENT_GONE
+                assert await taker is _CLIENT_GONE
+
+                # The tuple is back in the space, not lost.
+                assert srv.store.size() == 1
+                again = await srv._process_request(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0}
+                )
+                assert again["result"] == ["job", 7]
+            finally:
+                await srv.stop()
+
+        self._run(go())
+
+    def test_restored_tuple_keeps_its_expiry(self):
+        """Restoring must not turn a tuple written with sec= into an immortal one."""
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=0)
+            await srv.start()
+            try:
+                reader = asyncio.StreamReader()
+                taker = asyncio.create_task(srv._handle_take(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None},
+                    reader,
+                ))
+                await asyncio.sleep(0.05)
+
+                write = asyncio.create_task(
+                    srv._process_request({"op": "write", "tuple": ["job", 7], "sec": 30})
+                )
+                reader.feed_eof()
+                await write
+                await taker
+
+                restored = next(iter(srv.store._tuples.values()))
+                assert restored.expire_time is not None
+            finally:
+                await srv.stop()
+
+        self._run(go())
 
     def test_dead_taker_does_not_swallow_a_tuple(self, server, server_port):
         import json

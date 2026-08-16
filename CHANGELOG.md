@@ -5,10 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-16
 
 ### Fixed
 
+- **A `take` arriving mid-INSERT could park forever.** With `--db`, the write
+  path offered a tuple to parked waiters, awaited the INSERT, and only then
+  added it to the store. A `take` that arrived inside that window was too late
+  for the offer and too early to find the tuple, so it parked on a write that
+  had already gone by — and with the `sec=None` default it stayed parked until
+  some later matching write happened along, while the tuple sat in the space
+  unclaimed. The tuple now joins the store and is offered to waiters in one
+  synchronous block, so a `take` either finds it or parks after it is already
+  visible. A claimed tuple still never reaches disk.
+- **A tuple claimed for a client that had already gone was destroyed.** When a
+  parked `take` was woken at the same instant its peer disconnected, the server
+  held the tuple, saw the dead connection, and dropped it — even though the
+  reply is only written after the handler returns, so the tuple provably never
+  left the server. It is now put back into the space, with its original
+  `entry_id` and expiry intact. (The ambiguous case remains: once a reply has
+  been written to the socket, the server cannot know whether the client got it.
+  A `take` in flight when a consumer dies is still lost — the protocol has no
+  acknowledgement.)
+- **Tuples that expired while the server was down were never deleted.**
+  `load_all` filters them out of memory and the cleanup loop only sweeps what
+  it can see, so the rows accumulated on disk forever. `SQLiteBackend.delete_expired`
+  — present since the initial release and never called — now runs at startup.
 - **`take` could hand the same tuple to more than one client.** With `--db`
   persistence, `_handle_take` awaited the SQLite delete between finding a
   tuple and removing it from the store, so a concurrent `take` (or the write
@@ -66,6 +88,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   latency drops from ~64us to ~16us. The periodic WAL checkpoint cost lands on
   the dedicated storage thread and never stalls the event loop.
 
+- A written tuple now becomes visible to other clients just before it is
+  durable rather than just after, since the INSERT follows admission into the
+  space instead of preceding it. A `write` still returns `ok` only once the
+  commit lands, so a crash in that window leaves the writer knowing its write
+  is in doubt. A taker that claims the tuple mid-INSERT enqueues its DELETE
+  behind that INSERT on the single storage thread, so the two always land in
+  order and a taken tuple cannot come back on restart.
+
+### Added
+
+- Tested on Python 3.13 and 3.14 in CI, and both are now declared in the
+  package classifiers.
+
+### Documentation
+
+- `read` is documented as a snapshot rather than a reservation, including the
+  case where a blocked `read` and a `take` both receive the same freshly
+  written tuple. See "read is not a reservation" in the README.
+
 ### Removed
 
 - `SQLiteBackend.get_next_entry_id()`, which was unused.
@@ -114,5 +155,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Examples: producer/consumer over TCP.
 - GitHub Actions workflow running pytest on Python 3.10, 3.11, 3.12.
 
+[0.3.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.3.0
 [0.2.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.2.0
 [0.1.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.1.0

@@ -41,6 +41,10 @@ class Waiter:
     is_take: bool  # True for take, False for read
     seq: int  # monotonic insertion order; preserves FIFO among takers
     head_key: Any = _OTHER  # bucket key, or _OTHER if not indexable
+    # Entry this waiter claimed, kept so an undeliverable claim can be put
+    # back with its original entry_id and expire_time. Takers only: a read
+    # claims nothing.
+    claimed: Optional[TupleEntry] = None
 
 
 class TupleStore:
@@ -283,6 +287,12 @@ class TupleSpaceServer:
                 max_workers=1, thread_name_prefix="tuplespace-db"
             )
             self._entry_counter = await self._db_call(self.storage.initialize)
+            # Tuples that expired while the server was down are filtered out by
+            # load_all but never swept by the cleanup loop, which only sees what
+            # is in memory. Without this they accumulate on disk forever.
+            purged = await self._db_call(self.storage.delete_expired)
+            if purged:
+                logger.info("Purged %d expired tuple(s) from %s", purged, self.db_path)
             entries = await self._db_call(self.storage.load_all)
             self.store.load_from(entries)
             logger.info(f"Loaded {len(entries)} tuples from {self.db_path}")
@@ -570,23 +580,35 @@ class TupleSpaceServer:
         self._entry_counter += 1
         entry = TupleEntry(tuple_data, expire_time, self._entry_counter)
 
-        # Offer the tuple to parked waiters before it joins the space. A taker
-        # that claims it here consumes a tuple that never entered the store and
-        # never reached disk, so the common producer/consumer handoff costs no
-        # I/O at all instead of an INSERT immediately followed by a DELETE.
-        if self._wake_waiters(entry):
-            logger.debug("Write handed to parked taker: %s", tuple_data)
-            return {"status": "ok"}
-
-        # Nobody took it, so it joins the space. Persist first, then make it
-        # visible: a taker must never be able to race ahead of the INSERT.
-        if self.storage:
-            await self._db_call(self.storage.save, entry)
-
-        self.store.add(entry)
+        await self._admit(entry)
 
         logger.debug("Write: %s", tuple_data)
         return {"status": "ok"}
+
+    async def _admit(self, entry: TupleEntry) -> None:
+        """Put a tuple into the space, offering it to parked waiters first.
+
+        Ownership is decided in one synchronous block: the tuple joins the
+        space, then parked waiters get their shot. Nothing may await between
+        the two, so a take arriving afterwards cannot fall into a gap -- it
+        finds the tuple with find_match instead of parking on an offer that
+        has already gone by.
+        """
+        self.store.add(entry)
+        if self._wake_waiters(entry):
+            # Claimed in the same turn, so the tuple never has to reach disk:
+            # the common producer/consumer handoff costs no I/O at all instead
+            # of an INSERT immediately followed by a DELETE.
+            self.store.remove(entry)
+            logger.debug("Handed to parked taker: %s", entry.data)
+            return
+
+        # Nobody claimed it, so it stays. Persisting after the tuple is visible
+        # cannot resurrect a taken tuple: a taker that claims it while this
+        # INSERT is in flight enqueues its DELETE behind it on the single
+        # storage thread, so the two always land in order.
+        if self.storage:
+            await self._db_call(self.storage.save, entry)
 
     async def _handle_read(
         self, request: dict, reader: Optional[asyncio.StreamReader] = None
@@ -652,6 +674,13 @@ class TupleSpaceServer:
 
         result, disconnected = await self._wait_for_match(waiter, sec, reader)
         if disconnected:
+            if waiter.claimed is not None:
+                # A tuple was claimed for a client that is no longer there, and
+                # not one byte of it reached the socket -- the reply is only
+                # written once this handler returns. So it is certainly
+                # undelivered, and putting it back cannot duplicate it.
+                logger.debug("Restoring undelivered tuple: %s", waiter.claimed.data)
+                await self._admit(waiter.claimed)
             return _CLIENT_GONE
         return {"status": "ok", "result": result}
 
@@ -664,14 +693,15 @@ class TupleSpaceServer:
     def _wake_waiters(self, entry: TupleEntry) -> bool:
         """Offer a freshly written tuple to parked waiters.
 
-        Returns True if a taker consumed it, meaning the caller must not add
-        it to the store or persist it.
+        Returns True if a taker consumed it, meaning the caller must remove it
+        from the store again and must not persist it.
 
-        Called by ``_handle_write`` only, and always *before* the entry joins
-        the store, so there is nothing to remove and nothing on disk to delete.
-        Only waiters whose template could possibly match are considered: the
-        bucket keyed by the tuple's head element, plus the "other" bucket
-        (wildcard/type/unhashable heads).
+        Called by ``_handle_write`` only, immediately after the entry joins the
+        store and in the same synchronous block, so no other request can
+        observe the tuple in between. Nothing has reached disk yet, so a claim
+        here leaves nothing to delete. Only waiters whose template could
+        possibly match are considered: the bucket keyed by the tuple's head
+        element, plus the "other" bucket (wildcard/type/unhashable heads).
 
         Synchronous by design. With no await anywhere in the loop, a waiter
         that passes the ``future.done()`` check is still pending when its
@@ -691,6 +721,7 @@ class TupleSpaceServer:
                 if taken:
                     continue
                 waiter.future.set_result(entry.data)
+                waiter.claimed = entry
                 self._remove_waiter(waiter)
                 taken = True
                 logger.debug("Wake taker: %s", entry.data)
