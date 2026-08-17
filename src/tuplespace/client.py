@@ -5,9 +5,9 @@ Synchronous TupleSpace client with blocking I/O.
 import json
 import socket
 import struct
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
-from .core import Template, WILDCARD, encode_template, result_to_tuple
+from .core import Template, encode_template, result_to_tuple
 
 
 class TupleSpaceClient:

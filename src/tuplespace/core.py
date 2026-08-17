@@ -13,7 +13,7 @@ JSON wire protocol sentinels:
 
 import time
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 
 class Wildcard:
