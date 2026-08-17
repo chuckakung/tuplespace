@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-16
+
+### Changed
+
+- **Breaking:** `--db` is a snapshot file, not a per-write commit.
+  The in-memory store is the space. `write` and `take` never wait on disk.
+  The file is loaded at start, rewritten every `--snapshot-interval` seconds
+  (default 60; `0` disables the timer), and rewritten once more on a clean
+  shutdown. A crash loses mutations since the last dump. Handoff no longer
+  has a separate "skip disk" path: nothing was on the request path to skip.
+
+- Added `--snapshot-interval` / `TupleSpaceServer(snapshot_interval=...)`.
+
+### Removed
+
+- Per-tuple `SQLiteBackend.save` / `delete` on the request path. Replaced
+  by `save_snapshot`, which rewrites the file from a point-in-time copy of
+  the store.
+
 ## [0.3.0] - 2026-08-16
 
 ### Fixed
@@ -155,6 +174,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Examples: producer/consumer over TCP.
 - GitHub Actions workflow running pytest on Python 3.10, 3.11, 3.12.
 
+[0.4.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.4.0
 [0.3.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.3.0
 [0.2.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.2.0
 [0.1.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.1.0

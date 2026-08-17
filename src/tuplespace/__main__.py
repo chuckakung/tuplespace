@@ -34,7 +34,13 @@ def main():
         "--db",
         dest="db_path",
         default=None,
-        help="SQLite database path for persistence (default: in-memory only)",
+        help="SQLite snapshot file (loaded at start, dumped on a timer and on clean shutdown)",
+    )
+    parser.add_argument(
+        "--snapshot-interval",
+        type=float,
+        default=60.0,
+        help="Seconds between snapshots when --db is set (default: 60; 0 = shutdown only)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -73,14 +79,28 @@ def main():
     # Run server
     print(f"Starting TupleSpace server on {args.host}:{args.port}")
     if args.db_path:
-        print(f"Persistence enabled: {args.db_path}")
+        if args.snapshot_interval > 0:
+            print(
+                f"Snapshot file: {args.db_path} "
+                f"(every {args.snapshot_interval:g}s and on shutdown)"
+            )
+        else:
+            print(f"Snapshot file: {args.db_path} (shutdown only)")
     else:
-        print("Persistence disabled (in-memory only)")
+        print("No snapshot file (in-memory only)")
     if auth_token:
         print("Authentication enabled")
 
     try:
-        asyncio.run(run_server(args.host, args.port, args.db_path, auth_token))
+        asyncio.run(
+            run_server(
+                args.host,
+                args.port,
+                args.db_path,
+                auth_token,
+                snapshot_interval=args.snapshot_interval,
+            )
+        )
     except KeyboardInterrupt:
         print("\nShutting down...")
         sys.exit(0)

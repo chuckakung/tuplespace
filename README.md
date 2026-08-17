@@ -5,11 +5,12 @@ A multi-process coordination system using an asyncio-based server and synchronou
 ## Features
 
 - **Asyncio server**: All tuple state lives on one event loop thread, so
-  operations need no locks. Persistence runs on a single dedicated writer
-  thread; tuple state is never touched from it.
+  operations need no locks. Snapshots, if enabled, run on a single dedicated
+  writer thread; the claim path never waits on it.
 - **Synchronous clients**: Simple blocking API for easy integration
 - **JSON wire protocol**: Safe, cross-language compatible (no pickle)
-- **Persistence**: SQLite backend for crash recovery
+- **Snapshots**: Optional SQLite file loaded at start and rewritten on a
+  timer and on clean shutdown. Not a per-write commit.
 - **Authentication**: Optional token-based auth for client connections
 - **Pattern matching**: WILDCARD and type-based template matching
 - **Blocking operations**: read/take with timeout support
@@ -32,8 +33,12 @@ pip install -e .
 # In-memory only
 python -m tuplespace --port 9999
 
-# With persistence
+# With a snapshot file (warm start after a clean stop or a crash
+# within the last interval; default dump every 60s)
 python -m tuplespace --port 9999 --db tuplespace.db
+
+# Snapshot only on shutdown
+python -m tuplespace --port 9999 --db tuplespace.db --snapshot-interval 0
 
 # With authentication
 python -m tuplespace --port 9999 --token mysecret
@@ -133,9 +138,9 @@ pytest tests/ -v
 ```
 ┌─────────────────────────────┐
 │   TupleSpaceServer          │  (single-threaded asyncio)
-│   ├── TupleStore            │  (in-memory storage)
-│   ├── WaiterQueue           │  (asyncio.Future for blocking)
-│   └── SQLiteBackend         │  (persistence)
+│   ├── TupleStore            │  (in-memory; source of truth)
+│   ├── Waiters               │  (asyncio.Future for blocking)
+│   └── SQLiteBackend         │  (optional snapshots)
 └─────────────────────────────┘
          ▲    ▲    ▲
          │    │    │   TCP (JSON, length-prefixed)
@@ -145,6 +150,21 @@ pytest tests/ -v
 │Client │ │Client │ │Client │  (any language)
 └───────┘ └───────┘ └───────┘
 ```
+
+### Snapshots are not a commit log
+
+`--db` is a picture of the space, not a write-ahead log. `write` and `take`
+return as soon as the in-memory store is updated. The file is rewritten every
+`--snapshot-interval` seconds (default 60) and once more on a clean
+shutdown (`SIGINT` / `SIGTERM`).
+
+- A clean stop keeps the space.
+- A crash or `kill -9` loses mutations since the last dump.
+- A `take` after the last snapshot stays taken only if a later dump (or
+  shutdown) recorded it; otherwise the tuple comes back on restart.
+
+If producers can re-offer work after reconnect, you do not need `--db`.
+The space is the matching layer, not the system of record.
 
 ## API Reference
 

@@ -1,42 +1,41 @@
 """
-Persistent storage backend for TupleSpace (SQLite).
+Snapshot storage backend for TupleSpace (SQLite).
+
+The space itself is in memory. This module writes a point-in-time copy of
+the store and loads it on startup. It is never on the write/take path.
 """
 
 import json
 import sqlite3
 import time
 from typing import List, Optional
-from pathlib import Path
 
 from .core import TupleEntry
 
 
 class SQLiteBackend:
-    """SQLite-based persistent storage backend.
+    """SQLite snapshot file for TupleSpace.
 
     Synchronous by design. The asyncio server drives these methods from a
     single dedicated thread (see ``TupleSpaceServer._db_executor``); the
     connection uses ``check_same_thread=False`` and must not be shared across
-    a multi-worker pool, where commits from different threads would interleave.
+    a multi-worker pool.
     """
 
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn: Optional[sqlite3.Connection] = None
-        self._next_entry_id = 1
 
     def initialize(self) -> int:
-        """Initialize SQLite database and create tables.
+        """Open the snapshot file and create tables.
 
         Returns the next available entry_id for new tuples.
         """
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
-        # NORMAL skips the per-commit fsync. SQLite guarantees durability
-        # across *application* crashes regardless of this setting; only power
-        # loss or a kernel panic can roll back recent commits. That matches
-        # what this server can promise anyway, since a taken tuple is not
-        # acknowledged by the client.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        # Snapshots are periodic; a crash can lose the interval since the last
+        # one regardless of this setting. NORMAL is enough for application
+        # crashes during the rewrite itself.
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS tuples (
@@ -51,28 +50,14 @@ class SQLiteBackend:
         """)
         self.conn.commit()
 
-        # Determine next entry_id from existing data
         cursor = self.conn.execute("SELECT MAX(entry_id) FROM tuples")
         row = cursor.fetchone()
         if row[0] is not None:
-            self._next_entry_id = row[0] + 1
-
-        return self._next_entry_id
-
-    def save(self, entry: TupleEntry) -> None:
-        """Save a tuple entry to SQLite."""
-        serialized_data = json.dumps(entry.data)
-        self.conn.execute(
-            """
-            INSERT INTO tuples (entry_id, tuple_data, expire_time, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (entry.entry_id, serialized_data, entry.expire_time, time.time()),
-        )
-        self.conn.commit()
+            return row[0] + 1
+        return 1
 
     def load_all(self) -> List[TupleEntry]:
-        """Load all non-expired tuples from SQLite."""
+        """Load all non-expired tuples from the last snapshot."""
         current_time = time.time()
         cursor = self.conn.execute(
             """
@@ -92,13 +77,30 @@ class SQLiteBackend:
 
         return tuples
 
-    def delete(self, entry_id: int) -> None:
-        """Delete a tuple by its entry ID."""
-        self.conn.execute("DELETE FROM tuples WHERE entry_id = ?", (entry_id,))
-        self.conn.commit()
+    def save_snapshot(self, entries: List[TupleEntry]) -> None:
+        """Replace the file with a point-in-time copy of the space."""
+        now = time.time()
+        rows = [
+            (e.entry_id, json.dumps(e.data), e.expire_time, now)
+            for e in entries
+        ]
+        with self.conn:
+            self.conn.execute("DELETE FROM tuples")
+            if rows:
+                self.conn.executemany(
+                    """
+                    INSERT INTO tuples (entry_id, tuple_data, expire_time, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    rows,
+                )
 
     def delete_expired(self) -> int:
-        """Delete all expired tuples. Returns number deleted."""
+        """Delete tuples that expired while the server was down.
+
+        ``load_all`` already filters them out of memory; this keeps the file
+        from accumulating stale rows across restarts.
+        """
         current_time = time.time()
         cursor = self.conn.execute(
             """

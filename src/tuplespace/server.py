@@ -1,5 +1,5 @@
 """
-Asyncio-based TupleSpace server with persistence.
+Asyncio-based TupleSpace server with optional snapshot persistence.
 """
 
 import asyncio
@@ -166,6 +166,10 @@ class TupleStore:
         """
         return self._active_count
 
+    def snapshot(self) -> List[TupleEntry]:
+        """Point-in-time list of stored entries. Callers must not mutate them."""
+        return list(self._tuples.values())
+
     def load_from(self, entries: List[TupleEntry]) -> None:
         """Load entries from persistence."""
         self._tuples = {}
@@ -185,12 +189,15 @@ class TupleSpaceServer:
         port: int = 9999,
         db_path: Optional[str] = None,
         cleanup_interval: float = 60.0,
+        snapshot_interval: float = 60.0,
         auth_token: Optional[str] = None,
     ):
         self.host = host
         self.port = port
         self.db_path = db_path
         self.cleanup_interval = cleanup_interval
+        # 0 disables the periodic dump; a snapshot still runs on clean stop.
+        self.snapshot_interval = snapshot_interval
         self.auth_token = auth_token
 
         self.store = TupleStore()
@@ -203,9 +210,8 @@ class TupleSpaceServer:
         self._entry_counter = 0
         self._server: Optional[asyncio.Server] = None
         self._cleanup_task: Optional[asyncio.Task] = None
-        # All SQLite work runs on one dedicated thread. The connection is
-        # created with check_same_thread=False and is not safe to share across
-        # the default executor's pool, where concurrent commits would interleave.
+        self._snapshot_task: Optional[asyncio.Task] = None
+        # Snapshot I/O only. The claim path never waits on this thread.
         self._db_executor: Optional[ThreadPoolExecutor] = None
         # Live client connections, so shutdown can close them explicitly.
         self._client_writers: "set[asyncio.StreamWriter]" = set()
@@ -280,7 +286,7 @@ class TupleSpaceServer:
 
     async def start(self) -> None:
         """Start the server."""
-        # Initialize persistence if configured
+        # Load the last snapshot if configured. The claim path never writes it.
         if self.db_path:
             self.storage = SQLiteBackend(self.db_path)
             self._db_executor = ThreadPoolExecutor(
@@ -296,6 +302,8 @@ class TupleSpaceServer:
             entries = await self._db_call(self.storage.load_all)
             self.store.load_from(entries)
             logger.info(f"Loaded {len(entries)} tuples from {self.db_path}")
+            if self.snapshot_interval > 0:
+                self._snapshot_task = asyncio.create_task(self._snapshot_loop())
 
         # Start cleanup task
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -350,6 +358,13 @@ class TupleSpaceServer:
             except asyncio.CancelledError:
                 pass
 
+        if self._snapshot_task:
+            self._snapshot_task.cancel()
+            try:
+                await self._snapshot_task
+            except asyncio.CancelledError:
+                pass
+
         released = self._release_waiters()
         if released:
             logger.debug("Released %d parked waiter(s) for shutdown", released)
@@ -366,7 +381,14 @@ class TupleSpaceServer:
         if self._server:
             await self._server.wait_closed()
 
+        # Snapshot after clients are gone so undelivered takes have been
+        # put back. A crash before this point loses mutations since the
+        # last periodic dump; a clean stop does not.
         if self.storage:
+            try:
+                await self._snapshot()
+            except Exception:
+                pass
             await self._db_call(self.storage.close)
 
         if self._db_executor:
@@ -390,9 +412,6 @@ class TupleSpaceServer:
             await asyncio.sleep(self.cleanup_interval)
             try:
                 expired = self.store.remove_expired()
-                if expired and self.storage:
-                    for entry in expired:
-                        await self._db_call(self.storage.delete, entry.entry_id)
                 if expired:
                     logger.debug(f"Cleaned up {len(expired)} expired tuples")
             except asyncio.CancelledError:
@@ -400,19 +419,35 @@ class TupleSpaceServer:
             except Exception:
                 logger.exception("Error during expired-tuple cleanup")
 
-    async def _persist_delete(self, entry_id: int) -> None:
-        """Persist the removal of an already-claimed tuple.
+    async def _snapshot(self) -> None:
+        """Write the current store to the snapshot file.
 
-        Always called *after* ``store.remove`` has committed the claim, so a
-        storage failure cannot undo the take. The tuple may reappear on
-        restart if this fails; that is the at-least-once side of the tradeoff.
+        The copy is taken synchronously so the dump is a single point in time.
+        The rewrite runs on the db thread; callers of write/take do not wait.
         """
         if not self.storage:
             return
+        entries = self.store.snapshot()
         try:
-            await self._db_call(self.storage.delete, entry_id)
+            await self._db_call(self.storage.save_snapshot, entries)
         except Exception:
-            logger.exception("Failed to persist delete of entry %s", entry_id)
+            logger.exception("Failed to write snapshot to %s", self.db_path)
+            raise
+
+    async def _snapshot_loop(self) -> None:
+        """Rewrite the snapshot file on a timer.
+
+        A failed dump is logged and retried next interval. The space itself
+        does not depend on it.
+        """
+        while True:
+            await asyncio.sleep(self.snapshot_interval)
+            try:
+                await self._snapshot()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error during snapshot")
 
     async def _wait_for_match(
         self,
@@ -589,26 +624,12 @@ class TupleSpaceServer:
         """Put a tuple into the space, offering it to parked waiters first.
 
         Ownership is decided in one synchronous block: the tuple joins the
-        space, then parked waiters get their shot. Nothing may await between
-        the two, so a take arriving afterwards cannot fall into a gap -- it
-        finds the tuple with find_match instead of parking on an offer that
-        has already gone by.
+        store, then parked waiters get their shot. Disk is not involved.
         """
         self.store.add(entry)
         if self._wake_waiters(entry):
-            # Claimed in the same turn, so the tuple never has to reach disk:
-            # the common producer/consumer handoff costs no I/O at all instead
-            # of an INSERT immediately followed by a DELETE.
             self.store.remove(entry)
             logger.debug("Handed to parked taker: %s", entry.data)
-            return
-
-        # Nobody claimed it, so it stays. Persisting after the tuple is visible
-        # cannot resurrect a taken tuple: a taker that claims it while this
-        # INSERT is in flight enqueues its DELETE behind it on the single
-        # storage thread, so the two always land in order.
-        if self.storage:
-            await self._db_call(self.storage.save, entry)
 
     async def _handle_read(
         self, request: dict, reader: Optional[asyncio.StreamReader] = None
@@ -660,7 +681,6 @@ class TupleSpaceServer:
         entry = self.store.find_match(template)
         if entry:
             self.store.remove(entry)
-            await self._persist_delete(entry.entry_id)
             logger.debug("Take: %s", entry.data)
             return {"status": "ok", "result": entry.data}
 
@@ -694,12 +714,11 @@ class TupleSpaceServer:
         """Offer a freshly written tuple to parked waiters.
 
         Returns True if a taker consumed it, meaning the caller must remove it
-        from the store again and must not persist it.
+        from the store again.
 
-        Called by ``_handle_write`` only, immediately after the entry joins the
+        Called by ``_admit`` only, immediately after the entry joins the
         store and in the same synchronous block, so no other request can
-        observe the tuple in between. Nothing has reached disk yet, so a claim
-        here leaves nothing to delete. Only waiters whose template could
+        observe the tuple in between. Only waiters whose template could
         possibly match are considered: the bucket keyed by the tuple's head
         element, plus the "other" bucket (wildcard/type/unhashable heads).
 
@@ -739,6 +758,7 @@ async def run_server(
     port: int = 9999,
     db_path: Optional[str] = None,
     auth_token: Optional[str] = None,
+    snapshot_interval: float = 60.0,
 ) -> None:
     """Run the TupleSpace server until SIGINT or SIGTERM.
 
@@ -747,7 +767,13 @@ async def run_server(
     deadlocks whenever a client is connected, and it ignores SIGTERM entirely,
     which is what container runtimes and init systems actually send.
     """
-    server = TupleSpaceServer(host=host, port=port, db_path=db_path, auth_token=auth_token)
+    server = TupleSpaceServer(
+        host=host,
+        port=port,
+        db_path=db_path,
+        auth_token=auth_token,
+        snapshot_interval=snapshot_interval,
+    )
     await server.start()
 
     loop = asyncio.get_running_loop()

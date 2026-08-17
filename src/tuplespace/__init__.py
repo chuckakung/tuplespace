@@ -6,7 +6,7 @@ concurrent processes, using an asyncio-based server and synchronous clients.
 
 Basic usage:
     # Start server (in terminal or separate process)
-    python -m tuplespace --port 9999 --db tuplespace.db
+    python -m tuplespace --port 9999 --db tuplespace.db  # optional snapshot
 
     # Client code
     from tuplespace import TupleSpaceClient, WILDCARD
@@ -31,4 +31,4 @@ __all__ = [
     "run_server",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
