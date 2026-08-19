@@ -606,6 +606,13 @@ class TestTupleStoreInternals:
 class TestWaiterIndex:
     """Verify waiter bucketing and FIFO wake order."""
 
+    def test_admit_is_not_a_coroutine(self):
+        """Regression guard: an await in _admit would recreate missed wakeups."""
+        import inspect
+        from tuplespace.server import TupleSpaceServer
+
+        assert not inspect.iscoroutinefunction(TupleSpaceServer._admit)
+
     def _run(self, coro):
         loop = asyncio.new_event_loop()
         try:
