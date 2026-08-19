@@ -615,16 +615,16 @@ class TupleSpaceServer:
         self._entry_counter += 1
         entry = TupleEntry(tuple_data, expire_time, self._entry_counter)
 
-        await self._admit(entry)
+        self._admit(entry)
 
         logger.debug("Write: %s", tuple_data)
         return {"status": "ok"}
 
-    async def _admit(self, entry: TupleEntry) -> None:
+    def _admit(self, entry: TupleEntry) -> None:
         """Put a tuple into the space, offering it to parked waiters first.
 
-        Ownership is decided in one synchronous block: the tuple joins the
-        store, then parked waiters get their shot. Disk is not involved.
+        Not a coroutine: add and wake must not yield. An ``await`` in this
+        body is a syntax error, which is the point.
         """
         self.store.add(entry)
         if self._wake_waiters(entry):
@@ -700,7 +700,7 @@ class TupleSpaceServer:
                 # written once this handler returns. So it is certainly
                 # undelivered, and putting it back cannot duplicate it.
                 logger.debug("Restoring undelivered tuple: %s", waiter.claimed.data)
-                await self._admit(waiter.claimed)
+                self._admit(waiter.claimed)
             return _CLIENT_GONE
         return {"status": "ok", "result": result}
 
