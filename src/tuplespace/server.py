@@ -26,6 +26,9 @@ _CLIENT_GONE = object()  # sentinel: peer vanished while parked; drop the connec
 # Largest accepted wire frame. Bounds what an unauthenticated peer can make
 # the server buffer by declaring a huge length prefix.
 MAX_FRAME_BYTES = 8 * 1024 * 1024
+# How long stop() waits for client handlers to unwind before cancelling them.
+# Restore of an undelivered take happens in that unwind.
+_SHUTDOWN_HANDLER_TIMEOUT = 5.0
 
 
 class FrameTooLarge(Exception):
@@ -215,6 +218,9 @@ class TupleSpaceServer:
         self._db_executor: Optional[ThreadPoolExecutor] = None
         # Live client connections, so shutdown can close them explicitly.
         self._client_writers: "set[asyncio.StreamWriter]" = set()
+        # Handler tasks for those connections. stop() awaits these before
+        # snapshotting; Server.wait_closed() only does that on 3.12+.
+        self._client_tasks: "set[asyncio.Task]" = set()
 
     # --- waiter index helpers ---
 
@@ -347,9 +353,11 @@ class TupleSpaceServer:
     async def stop(self) -> None:
         """Stop the server.
 
-        Parked waiters are released and open connections closed before
-        awaiting ``wait_closed()``; otherwise any connected client -- even an
-        idle one -- keeps the server alive indefinitely.
+        Parked waiters are released and open connections closed, then
+        client handler tasks are awaited, then ``wait_closed()``. Handlers
+        must finish before a snapshot: an undelivered take is restored as
+        the handler unwinds. ``wait_closed()`` only waits for handlers on
+        3.12+, so the task wait is what makes a clean stop version-safe.
         """
         if self._cleanup_task:
             self._cleanup_task.cancel()
@@ -378,6 +386,8 @@ class TupleSpaceServer:
             if not writer.is_closing():
                 writer.close()
 
+        await self._await_client_handlers()
+
         if self._server:
             await self._server.wait_closed()
 
@@ -396,6 +406,28 @@ class TupleSpaceServer:
             self._db_executor = None
 
         logger.info("Server stopped")
+
+    async def _await_client_handlers(self) -> None:
+        """Wait for connection handlers to finish, then cancel stragglers.
+
+        A claimed tuple that has not yet been written to the socket lives
+        only in that handler until it restores or replies. Snapshotting
+        earlier can drop it on a clean stop.
+        """
+        pending = [t for t in self._client_tasks if not t.done()]
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=_SHUTDOWN_HANDLER_TIMEOUT)
+        if not still:
+            return
+        logger.warning(
+            "Cancelling %d client handler(s) still running after %.1fs",
+            len(still),
+            _SHUTDOWN_HANDLER_TIMEOUT,
+        )
+        for t in still:
+            t.cancel()
+        await asyncio.wait(still)
 
     def _db_call(self, fn: Callable, *args) -> asyncio.Future:
         """Run a storage call on the dedicated SQLite thread."""
@@ -522,6 +554,9 @@ class TupleSpaceServer:
         """Handle a client connection."""
         addr = writer.get_extra_info("peername")
         logger.debug(f"Client connected: {addr}")
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_tasks.add(task)
         self._client_writers.add(writer)
 
         try:
@@ -566,6 +601,8 @@ class TupleSpaceServer:
             logger.exception(f"Error handling client {addr}")
         finally:
             self._client_writers.discard(writer)
+            if task is not None:
+                self._client_tasks.discard(task)
             writer.close()
             try:
                 await writer.wait_closed()

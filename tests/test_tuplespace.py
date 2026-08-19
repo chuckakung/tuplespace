@@ -1294,6 +1294,81 @@ class TestShutdown:
         finally:
             loop.close()
 
+    def test_stop_waits_for_client_handler_tasks(self):
+        """stop() must not proceed to snapshot while a handler is still unwinding."""
+        async def go():
+            srv = TupleSpaceServer(host="localhost", port=0)
+            await srv.start()
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def linger():
+                task = asyncio.current_task()
+                srv._client_tasks.add(task)
+                try:
+                    started.set()
+                    await release.wait()
+                finally:
+                    srv._client_tasks.discard(task)
+
+            linger_task = asyncio.create_task(linger())
+            await started.wait()
+
+            stop_task = asyncio.create_task(srv.stop())
+            await asyncio.sleep(0.05)
+            assert not stop_task.done()
+            release.set()
+            await asyncio.wait_for(stop_task, timeout=2)
+            await linger_task
+
+        self._run(go())
+
+    def test_clean_stop_snapshots_a_restored_claim(self):
+        """A take claimed as its peer dies must land in the shutdown snapshot.
+
+        The tuple lives only in the handler until restore; stop() has to
+        wait for that handler, not for wait_closed() (a 3.12-only wait).
+        """
+        db_path = os.path.join(tempfile.mkdtemp(), "restore-stop.db")
+
+        async def go():
+            srv = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
+            await srv.start()
+            reader = asyncio.StreamReader()
+            taker = asyncio.create_task(srv._handle_take(
+                {"op": "take", "template": ["job", "__WILDCARD__"], "sec": None},
+                reader,
+            ))
+            srv._client_tasks.add(taker)
+            try:
+                await asyncio.sleep(0.05)
+                write = asyncio.create_task(
+                    srv._process_request({"op": "write", "tuple": ["job", 7]})
+                )
+                reader.feed_eof()
+                await write
+                await srv.stop()
+                await taker
+            finally:
+                srv._client_tasks.discard(taker)
+
+            srv2 = TupleSpaceServer(
+                host="localhost", port=0, db_path=db_path, snapshot_interval=0,
+            )
+            await srv2.start()
+            try:
+                assert srv2.store.size() == 1
+                got = await srv2._process_request(
+                    {"op": "take", "template": ["job", "__WILDCARD__"], "sec": 0}
+                )
+                assert got["result"] == ["job", 7]
+            finally:
+                await srv2.stop()
+
+        self._run(go())
+
     def test_stop_completes_with_a_parked_waiter(self):
         import json
         import socket
