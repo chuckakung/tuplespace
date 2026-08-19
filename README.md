@@ -217,4 +217,4 @@ which is worse for the monitoring and logging patterns `read` exists to serve.
 
 ---
 
-Built with [Claude Code](https://claude.ai/code)
+Built with [Claude Code](https://claude.ai/code) and [Grok](https://grok.com)

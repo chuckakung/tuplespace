@@ -12,6 +12,7 @@ license = {text = "MIT"}
 authors = [
     {name = "Charles Kung", email = "charleskung@gmail.com"},
     {name = "Claude (Anthropic)", email = "noreply@anthropic.com"},
+    {name = "Grok (xAI)", email = "noreply@x.ai"},
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
