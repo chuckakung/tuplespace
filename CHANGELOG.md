@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A clean stop on Python 3.10/3.11 could snapshot before a handler restored
+  an undelivered take. ``Server.wait_closed()`` only waits for handlers from
+  3.12; ``stop()`` now awaits those tasks itself before writing the snapshot.
+
 ### Changed
 
 - ``_admit`` is a plain ``def``, not a coroutine. Add-then-wake must not
