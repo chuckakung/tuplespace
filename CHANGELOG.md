@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A timed-out blocking ``read``/``take`` (``sec > 0``, nothing matched) left
+  the disconnect watch (``reader.read(1)``) cancelled but still registered as
+  the StreamReader waiter. The next request on that connection then crashed
+  the handler with ``readexactly() called while another coroutine is already
+  waiting for incoming data``, and the client saw Connection reset / Broken
+  pipe. ``_wait_for_match`` now awaits the cancelled watch so the handler can
+  read the next frame.
+
 - A clean stop on Python 3.10/3.11 could snapshot before a handler restored
   an undelivered take. ``Server.wait_closed()`` only waits for handlers from
   3.12; ``stop()`` now awaits those tasks itself before writing the snapshot.
