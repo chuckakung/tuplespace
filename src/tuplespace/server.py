@@ -11,8 +11,8 @@ import signal
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .core import TupleEntry, Template, Wildcard, decode_template
 from .storage import SQLiteBackend
@@ -20,7 +20,7 @@ from .storage import SQLiteBackend
 logger = logging.getLogger(__name__)
 
 
-_OTHER = object()  # sentinel: waiter has no indexable head
+_OTHER = object()  # sentinel: waiter has no concrete hashable field
 _CLIENT_GONE = object()  # sentinel: peer vanished while parked; drop the connection
 
 # Largest accepted wire frame. Bounds what an unauthenticated peer can make
@@ -64,6 +64,27 @@ class FrameTooLarge(Exception):
     """A peer declared a frame larger than MAX_FRAME_BYTES."""
 
 
+def _index_key(value: Any) -> Tuple[bool, Any]:
+    """Return (True, value) if it can be an index key, else (False, None)."""
+    try:
+        hash(value)
+    except TypeError:
+        return False, None
+    return True, value
+
+
+def _template_index_keys(template: Template) -> List[Tuple[int, Any]]:
+    """Concrete hashable (position, value) pairs in a template."""
+    keys: List[Tuple[int, Any]] = []
+    for i, item in enumerate(template.pattern):
+        if isinstance(item, Wildcard) or isinstance(item, type):
+            continue
+        ok, key = _index_key(item)
+        if ok:
+            keys.append((i, key))
+    return keys
+
+
 @dataclass
 class Waiter:
     """A client waiting for a matching tuple."""
@@ -72,75 +93,121 @@ class Waiter:
     future: asyncio.Future
     is_take: bool  # True for take, False for read
     seq: int  # monotonic insertion order; preserves FIFO among takers
-    head_key: Any = _OTHER  # bucket key, or _OTHER if not indexable
+    # Concrete hashable template fields this waiter is bucketed under.
+    # Empty means "other": wildcard/type/unhashable/empty pattern.
+    index_keys: List[Tuple[int, Any]] = field(default_factory=list)
     # Entry this waiter claimed, kept so an undeliverable claim can be put
     # back with its original entry_id and expire_time. Takers only: a read
     # claims nothing.
     claimed: Optional[TupleEntry] = None
 
+    @property
+    def head_key(self) -> Any:
+        """Position-0 bucket key, or ``_OTHER`` if the head is not indexable."""
+        for i, key in self.index_keys:
+            if i == 0:
+                return key
+        return _OTHER
+
 
 class TupleStore:
-    """In-memory tuple store with a hash index on the first ("head") element.
+    """In-memory tuple store with a hash index on every positional field.
 
     Storage is dict-backed and keyed by ``entry_id``, so ``remove`` is O(1).
     A live ``_active_count`` makes ``size()`` O(1). Entries with a finite
     ``expire_time`` are also tracked in a min-heap so ``remove_expired`` is
     O(k log n) instead of a full scan.
 
-    Templates whose first element is a concrete hashable value match against
-    only the corresponding bucket. Templates with a wildcard, type matcher,
-    or unhashable value in head position fall back to a full scan in
-    insertion order.
+    Each hashable element is inserted into ``_by_pos[i][value]``. A template
+    with concrete hashable fields intersects those posting lists (smallest
+    bucket first, then O(1) membership in the rest) so a lookup only visits
+    tuples that match every equality constraint. Wildcard, type matcher, or
+    unhashable at a position skip that index; if no position is usable,
+    matching falls back to a full scan in insertion order.
     """
 
     def __init__(self):
         # Insertion-ordered (Python 3.7+ dict guarantee); supports O(1) remove.
         self._tuples: Dict[int, TupleEntry] = {}
-        self._by_head: Dict[Any, Dict[int, TupleEntry]] = {}
+        # Position -> value -> {entry_id: entry}. Grows as longer tuples arrive.
+        self._by_pos: List[Dict[Any, Dict[int, TupleEntry]]] = []
         self._active_count = 0
         # (expire_time, entry_id); stale entries are skipped lazily on pop.
         self._expiry_heap: List[Tuple[float, int]] = []
 
+    @property
+    def _by_head(self) -> Dict[Any, Dict[int, TupleEntry]]:
+        """Position-0 index. Empty dict if no tuples have been indexed there."""
+        return self._by_pos[0] if self._by_pos else {}
+
     @staticmethod
     def _head_key(value: Any) -> Tuple[bool, Any]:
-        """Return (True, head) if value can be used as an index key, else (False, None)."""
-        try:
-            hash(value)
-        except TypeError:
-            return False, None
-        return True, value
+        return _index_key(value)
 
     def _index_add(self, entry: TupleEntry) -> None:
-        if not entry.data:
+        data = entry.data
+        if not data:
             return
-        ok, head = self._head_key(entry.data[0])
-        if not ok:
-            return
-        self._by_head.setdefault(head, {})[entry.entry_id] = entry
+        while len(self._by_pos) < len(data):
+            self._by_pos.append({})
+        for i, value in enumerate(data):
+            ok, key = _index_key(value)
+            if not ok:
+                continue
+            self._by_pos[i].setdefault(key, {})[entry.entry_id] = entry
 
     def _index_remove(self, entry: TupleEntry) -> None:
-        if not entry.data:
+        data = entry.data
+        if not data:
             return
-        ok, head = self._head_key(entry.data[0])
-        if not ok:
-            return
-        bucket = self._by_head.get(head)
-        if not bucket:
-            return
-        bucket.pop(entry.entry_id, None)
-        if not bucket:
-            del self._by_head[head]
+        for i, value in enumerate(data):
+            if i >= len(self._by_pos):
+                break
+            ok, key = _index_key(value)
+            if not ok:
+                continue
+            bucket = self._by_pos[i].get(key)
+            if not bucket:
+                continue
+            bucket.pop(entry.entry_id, None)
+            if not bucket:
+                del self._by_pos[i][key]
 
-    def _candidates(self, template: Template):
-        """Pick the smallest iterable of entries that could possibly match."""
-        if template.pattern:
-            head = template.pattern[0]
-            if not isinstance(head, Wildcard) and not isinstance(head, type):
-                ok, key = self._head_key(head)
-                if ok:
-                    bucket = self._by_head.get(key)
-                    return bucket.values() if bucket else ()
-        return self._tuples.values()
+    def _candidates(self, template: Template) -> Iterable[TupleEntry]:
+        """Entries that match every concrete hashable field of ``template``.
+
+        Intersect per-position posting lists: walk the smallest bucket in
+        insertion order and keep an entry only if its id is in every other
+        bucket. That is O(k) dict hits per survivor, not a scan of the
+        smallest list with ``Template.matches`` filtering the rest.
+        """
+        buckets: List[Dict[int, TupleEntry]] = []
+        for i, item in enumerate(template.pattern):
+            if isinstance(item, Wildcard) or isinstance(item, type):
+                continue
+            ok, key = _index_key(item)
+            if not ok:
+                continue
+            if i >= len(self._by_pos):
+                return ()
+            bucket = self._by_pos[i].get(key)
+            if not bucket:
+                return ()
+            buckets.append(bucket)
+        if not buckets:
+            return self._tuples.values()
+        if len(buckets) == 1:
+            return buckets[0].values()
+        buckets.sort(key=len)
+        smallest = buckets[0]
+        rest = buckets[1:]
+
+        def intersecting():
+            for eid, entry in smallest.items():
+                if all(eid in b for b in rest):
+                    yield entry
+
+        return intersecting()
 
     def add(self, entry: TupleEntry) -> None:
         """Add a tuple entry to the store."""
@@ -205,7 +272,7 @@ class TupleStore:
     def load_from(self, entries: List[TupleEntry]) -> None:
         """Load entries from persistence."""
         self._tuples = {}
-        self._by_head = {}
+        self._by_pos = []
         self._active_count = 0
         self._expiry_heap = []
         for entry in entries:
@@ -234,9 +301,10 @@ class TupleSpaceServer:
 
         self.store = TupleStore()
         self.storage: Optional[SQLiteBackend] = None
-        # Waiters bucketed by template head (mirrors TupleStore's head index).
-        self._waiters_by_head: Dict[Any, Dict[int, Waiter]] = {}
-        # Waiters whose head is wildcard/type/unhashable/empty.
+        # Waiters bucketed by each concrete hashable template field
+        # (mirrors TupleStore's per-position index).
+        self._waiters_by_pos: List[Dict[Any, Dict[int, Waiter]]] = []
+        # Waiters with no concrete hashable field (all-wildcard / types / empty).
         self._waiters_other: Dict[int, Waiter] = {}
         self._waiter_seq = 0
         self._entry_counter = 0
@@ -253,69 +321,72 @@ class TupleSpaceServer:
 
     # --- waiter index helpers ---
 
-    @staticmethod
-    def _waiter_head_key(template: Template) -> Any:
-        """Return the bucket key for this template, or _OTHER if not indexable."""
-        if not template.pattern:
-            return _OTHER
-        head = template.pattern[0]
-        if isinstance(head, Wildcard) or isinstance(head, type):
-            return _OTHER
-        try:
-            hash(head)
-        except TypeError:
-            return _OTHER
-        return head
+    @property
+    def _waiters_by_head(self) -> Dict[Any, Dict[int, Waiter]]:
+        """Position-0 waiter index. Empty dict if nothing is bucketed there."""
+        return self._waiters_by_pos[0] if self._waiters_by_pos else {}
 
     def _add_waiter(self, template: Template, future: asyncio.Future, is_take: bool) -> Waiter:
         self._waiter_seq += 1
+        keys = _template_index_keys(template)
         waiter = Waiter(
             template=template,
             future=future,
             is_take=is_take,
             seq=self._waiter_seq,
-            head_key=self._waiter_head_key(template),
+            index_keys=keys,
         )
-        if waiter.head_key is _OTHER:
-            self._waiters_other[id(waiter)] = waiter
-        else:
-            self._waiters_by_head.setdefault(waiter.head_key, {})[id(waiter)] = waiter
+        wid = id(waiter)
+        if not keys:
+            self._waiters_other[wid] = waiter
+            return waiter
+        for i, key in keys:
+            while len(self._waiters_by_pos) <= i:
+                self._waiters_by_pos.append({})
+            self._waiters_by_pos[i].setdefault(key, {})[wid] = waiter
         return waiter
 
     def _remove_waiter(self, waiter: Waiter) -> None:
         wid = id(waiter)
-        if waiter.head_key is _OTHER:
+        if not waiter.index_keys:
             self._waiters_other.pop(wid, None)
-        else:
-            bucket = self._waiters_by_head.get(waiter.head_key)
-            if bucket is not None:
-                bucket.pop(wid, None)
-                if not bucket:
-                    del self._waiters_by_head[waiter.head_key]
+            return
+        for i, key in waiter.index_keys:
+            if i >= len(self._waiters_by_pos):
+                continue
+            bucket = self._waiters_by_pos[i].get(key)
+            if bucket is None:
+                continue
+            bucket.pop(wid, None)
+            if not bucket:
+                del self._waiters_by_pos[i][key]
 
     def _waiter_candidates(self, entry: TupleEntry) -> List[Waiter]:
         """Waiters that could possibly match the given entry (FIFO order).
 
-        Each source dict is insertion-ordered, and waiters are inserted in
-        seq order, so each is already sorted by seq. heapq.merge gives an
-        O(C) two-way merge instead of an O(C log C) sort.
+        Union of the unconstrained bucket and every per-position bucket whose
+        key equals the written tuple at that index. A waiter with several
+        concrete fields appears in several buckets; we unique by identity
+        and sort by ``seq`` so FIFO among takers is preserved.
         """
-        head_bucket: Dict[int, Waiter] = {}
-        if entry.data:
-            try:
-                head_bucket = self._waiters_by_head.get(entry.data[0], {})
-            except TypeError:
-                # Unhashable head: only "other" waiters can possibly match.
-                head_bucket = {}
-        if not head_bucket and not self._waiters_other:
+        if not self._waiters_other and not self._waiters_by_pos:
             return []
-        return list(
-            heapq.merge(
-                head_bucket.values(),
-                self._waiters_other.values(),
-                key=lambda w: w.seq,
-            )
-        )
+        seen: Dict[int, Waiter] = {}
+        for wid, waiter in self._waiters_other.items():
+            seen[wid] = waiter
+        if entry.data:
+            for i, value in enumerate(entry.data):
+                ok, key = _index_key(value)
+                if not ok or i >= len(self._waiters_by_pos):
+                    continue
+                bucket = self._waiters_by_pos[i].get(key)
+                if not bucket:
+                    continue
+                for wid, waiter in bucket.items():
+                    seen[wid] = waiter
+        if not seen:
+            return []
+        return sorted(seen.values(), key=lambda w: w.seq)
 
     # --- lifecycle ---
 
@@ -369,15 +440,17 @@ class TupleSpaceServer:
         for every handler to finish. Without this, shutdown deadlocks against
         the server's own idle clients.
         """
-        waiters = list(self._waiters_other.values())
-        for bucket in self._waiters_by_head.values():
-            waiters.extend(bucket.values())
-        for waiter in waiters:
+        seen: Dict[int, Waiter] = dict(self._waiters_other)
+        for pos_map in self._waiters_by_pos:
+            for bucket in pos_map.values():
+                seen.update(bucket)
+        for waiter in seen.values():
             if not waiter.future.done():
                 waiter.future.cancel()
+        n = len(seen)
         self._waiters_other.clear()
-        self._waiters_by_head.clear()
-        return len(waiters)
+        self._waiters_by_pos.clear()
+        return n
 
     async def stop(self) -> None:
         """Stop the server.
@@ -790,8 +863,9 @@ class TupleSpaceServer:
         Called by ``_admit`` only, immediately after the entry joins the
         store and in the same synchronous block, so no other request can
         observe the tuple in between. Only waiters whose template could
-        possibly match are considered: the bucket keyed by the tuple's head
-        element, plus the "other" bucket (wildcard/type/unhashable heads).
+        possibly match are considered: per-position buckets whose key equals
+        the written tuple at that index, plus the "other" bucket (no concrete
+        hashable field).
 
         Synchronous by design. With no await anywhere in the loop, a waiter
         that passes the ``future.done()`` check is still pending when its
