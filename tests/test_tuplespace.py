@@ -159,6 +159,91 @@ class TestBasicOperations:
         assert client.ping() is True
 
 
+class TestUpdate:
+    """update is atomic take+write of the first FIFO match."""
+
+    def test_update_replaces_and_returns_old(self, client):
+        client.write(("task", "pending", 1))
+        old = client.update(("task", "pending", WILDCARD), ("task", "done", 1), sec=0)
+        assert old == ("task", "pending", 1)
+        assert client.take(("task", "done", 1), sec=0) == ("task", "done", 1)
+        assert client.take(("task", WILDCARD, WILDCARD), sec=0) is None
+
+    def test_update_miss_is_none(self, client):
+        assert client.update(("missing",), ("x",), sec=0) is None
+        assert client.size() == 0
+
+    def test_update_first_of_many(self, client):
+        client.write(("job", 1))
+        client.write(("job", 2))
+        client.write(("job", 3))
+        old = client.update(("job", WILDCARD), ("job", 9), sec=0)
+        assert old == ("job", 1)
+        leftover = client.read_all(("job", WILDCARD))
+        assert leftover == [("job", 2), ("job", 3), ("job", 9)]
+
+    def test_update_does_not_touch_non_matches(self, client):
+        client.write(("job", 1))
+        client.write(("other", 1))
+        client.update(("job", WILDCARD), ("job", 2), sec=0)
+        assert client.take(("other", 1), sec=0) == ("other", 1)
+
+    def test_blocking_update(self, server, server_port):
+        result_holder = [None]
+
+        def updater():
+            with TupleSpaceClient("localhost", server_port) as client:
+                result_holder[0] = client.update(
+                    ("delayed",), ("delayed", "done"), sec=5
+                )
+
+        def writer():
+            time.sleep(0.3)
+            with TupleSpaceClient("localhost", server_port) as client:
+                client.write(("delayed",))
+
+        u = threading.Thread(target=updater)
+        w = threading.Thread(target=writer)
+        u.start()
+        w.start()
+        u.join(timeout=5)
+        w.join(timeout=2)
+        assert result_holder[0] == ("delayed",)
+        with TupleSpaceClient("localhost", server_port) as client:
+            assert client.take(("delayed", "done"), sec=0) == ("delayed", "done")
+
+    def test_update_wakes_taker_on_new_shape(self, server, server_port):
+        """A take parked on the new shape must get the replacement."""
+        taken = [None]
+
+        def taker():
+            with TupleSpaceClient("localhost", server_port) as client:
+                taken[0] = client.take(("task", "done"), sec=5)
+
+        def updater():
+            time.sleep(0.3)
+            with TupleSpaceClient("localhost", server_port) as client:
+                client.write(("task", "pending"))
+                old = client.update(("task", "pending"), ("task", "done"), sec=0)
+                assert old == ("task", "pending")
+
+        t = threading.Thread(target=taker)
+        u = threading.Thread(target=updater)
+        t.start()
+        u.start()
+        t.join(timeout=5)
+        u.join(timeout=2)
+        assert taken[0] == ("task", "done")
+        with TupleSpaceClient("localhost", server_port) as client:
+            assert client.size() == 0
+
+    def test_update_expire_on_replacement(self, client):
+        client.write(("ephemeral", 1))
+        client.update(("ephemeral", WILDCARD), ("ephemeral", 2), sec=0, expire=0.05)
+        time.sleep(0.15)
+        assert client.take(("ephemeral", WILDCARD), sec=0) is None
+
+
 class TestBlockingOperations:
     """Tests for blocking read/take operations."""
 

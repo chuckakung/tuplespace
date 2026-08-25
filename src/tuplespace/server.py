@@ -734,6 +734,8 @@ class TupleSpaceServer:
                 return await self._handle_read(request, reader)
             elif op == "take":
                 return await self._handle_take(request, reader)
+            elif op == "update":
+                return await self._handle_update(request, reader)
             elif op == "read_all":
                 return await self._handle_read_all(request)
             elif op == "size":
@@ -847,6 +849,54 @@ class TupleSpaceServer:
                 self._admit(waiter.claimed)
             return _CLIENT_GONE
         return {"status": "ok", "result": result}
+
+    async def _handle_update(
+        self, request: dict, reader: Optional[asyncio.StreamReader] = None
+    ) -> Any:
+        """Replace the first matching tuple (same match as take).
+
+        ``sec`` is the wait for a match (Rinda-style). ``expire`` is the new
+        tuple's TTL in seconds, like write's ``sec``. Claim and admit stay in
+        one synchronous run on the immediate path so nothing yields between
+        removing the old tuple and offering the replacement to waiters.
+        """
+        template = Template(decode_template(request["template"]))
+        replacement = request["tuple"]
+        sec = request.get("sec")
+        expire = request.get("expire")
+
+        entry = self.store.find_match(template)
+        if entry:
+            self.store.remove(entry)
+            self._admit_replacement(replacement, expire)
+            logger.debug("Update: %s -> %s", entry.data, replacement)
+            return {"status": "ok", "result": entry.data}
+
+        if sec == 0:
+            return {"status": "ok", "result": None}
+
+        future = asyncio.get_running_loop().create_future()
+        waiter = self._add_waiter(template, future, is_take=True)
+
+        result, disconnected = await self._wait_for_match(waiter, sec, reader)
+        if disconnected:
+            if waiter.claimed is not None:
+                logger.debug("Restoring undelivered tuple: %s", waiter.claimed.data)
+                self._admit(waiter.claimed)
+            return _CLIENT_GONE
+        if result is None:
+            return {"status": "ok", "result": None}
+
+        self._admit_replacement(replacement, expire)
+        logger.debug("Update (woken): %s -> %s", result, replacement)
+        return {"status": "ok", "result": result}
+
+    def _admit_replacement(self, tuple_data, expire: Optional[float]) -> None:
+        expire_time = None
+        if expire is not None:
+            expire_time = time.time() + expire
+        self._entry_counter += 1
+        self._admit(TupleEntry(tuple_data, expire_time, self._entry_counter))
 
     async def _handle_read_all(self, request: dict) -> dict:
         """Handle read_all operation."""
