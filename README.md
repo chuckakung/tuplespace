@@ -174,6 +174,7 @@ The space is the matching layer, not the system of record.
 - `write(tuple, sec=None)` - Write a tuple (optional expiration in seconds)
 - `read(template, sec=None)` - Non-destructive read. `sec=None` blocks forever, `0` is immediate, `>0` blocks up to `sec` seconds. Returns a snapshot, not a reservation — see [read is not a reservation](#read-is-not-a-reservation)
 - `take(template, sec=None)` - Destructive read (same `sec` semantics as `read`)
+- `update(template, tuple, sec=None, expire=None)` - Replace the first matching tuple (same FIFO match as `take`). Returns the old tuple, or `None` on a finite miss. `sec` waits for a match; `expire` is the replacement's TTL. This is the claim — do not `read` then `update`.
 - `read_all(template)` - Return all matching tuples
 - `size()` - Number of tuples in the space
 - `ping()` - Check server connectivity

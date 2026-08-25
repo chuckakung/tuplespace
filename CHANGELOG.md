@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ``update(template, tuple, sec=None, expire=None)`` replaces the first
+  matching tuple (same FIFO match as ``take``) with a new one. The old
+  tuple is returned. ``sec`` waits for a match; ``expire`` is the
+  replacement's TTL. Claim and admit do not yield, so a waiter for the
+  new shape can take the replacement in the same turn.
+
 ### Fixed
 
 - A timed-out blocking ``read``/``take`` (``sec > 0``, nothing matched) left

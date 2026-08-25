@@ -170,6 +170,46 @@ class TupleSpaceClient:
         finally:
             self._socket.settimeout(None)
 
+    def update(
+        self,
+        template: Union[tuple, Template],
+        tuple_data: tuple,
+        sec: Optional[float] = None,
+        expire: Optional[float] = None,
+    ) -> Optional[tuple]:
+        """Replace the first matching tuple with ``tuple_data``.
+
+        Same match as ``take``: the earliest inserted match, not every match.
+        This is the claim — do not ``read`` then ``update``. ``sec`` waits for
+        a match (None forever, 0 immediate, >0 up to that many seconds).
+        ``expire`` is the replacement's TTL, like ``write(..., sec=)``.
+
+        Returns the old tuple, or None if ``sec`` was finite and nothing
+        matched. A parked ``take`` on the new shape may consume the
+        replacement in the same admit, so it may never sit in the space.
+        """
+        if isinstance(template, Template):
+            template = template.pattern
+
+        if sec is None:
+            self._socket.settimeout(None)
+        elif sec > 0:
+            self._socket.settimeout(sec + 5)
+        else:
+            self._socket.settimeout(30)
+
+        try:
+            response = self._send_request({
+                "op": "update",
+                "template": encode_template(template),
+                "tuple": list(tuple_data),
+                "sec": sec,
+                "expire": expire,
+            })
+            return result_to_tuple(response.get("result"))
+        finally:
+            self._socket.settimeout(None)
+
     def read_all(self, template: Union[tuple, Template]) -> List[tuple]:
         """Read all tuples matching the template.
 
