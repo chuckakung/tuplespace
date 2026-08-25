@@ -215,6 +215,10 @@ which is worse for the monitoring and logging patterns `read` exists to serve.
 - `int`, `str`, `float`, etc. - Match by type
 - Literal values - Exact match
 
+Every field is matched. Hashable literals are indexed at that position
+and AND-intersected, so `("task", "research", WILDCARD, goal_id)` only
+visits tuples that have all of those values — not every `"task"`.
+
 ---
 
 Built with [Claude Code](https://claude.ai/code) and [Grok](https://grok.com)

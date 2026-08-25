@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The in-memory store and parked waiters are indexed on every hashable
+  positional field, not only the tuple head. Equality constraints at
+  several positions are AND-intersected (smallest posting list first),
+  so ``("task", "research", WILDCARD, goal_id)`` only visits tuples that
+  have all of those values.
+
 - ``_admit`` is a plain ``def``, not a coroutine. Add-then-wake must not
   yield; an ``await`` in that body is now a syntax error.
 

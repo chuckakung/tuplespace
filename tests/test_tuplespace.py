@@ -481,7 +481,7 @@ class CountingTemplate(Template):
 
 
 class TestTupleStoreHeadIndex:
-    """Verify the head-element hash index in TupleStore."""
+    """Verify the per-position hash index in TupleStore."""
 
     def test_concrete_head_only_scans_its_bucket(self):
         store = TupleStore()
@@ -496,7 +496,21 @@ class TestTupleStoreHeadIndex:
         assert entry.data == ["rare", 42]
         assert tmpl.match_calls == 1
 
-    def test_wildcard_head_falls_back_to_full_scan(self):
+    def test_concrete_later_field_only_scans_its_bucket(self):
+        store = TupleStore()
+        for i in range(1000):
+            store.add(TupleEntry(["task", "noise", i], None, i + 1))
+        store.add(TupleEntry(["task", "research", 42], None, 1001))
+
+        tmpl = CountingTemplate(("task", "research", WILDCARD))
+        entry = store.find_match(tmpl)
+
+        assert entry is not None
+        assert entry.data == ["task", "research", 42]
+        # Kind bucket is size 1; head bucket would have been 1001.
+        assert tmpl.match_calls == 1
+
+    def test_wildcard_head_uses_later_field_index(self):
         store = TupleStore()
         store.add(TupleEntry(["a", 1], None, 1))
         store.add(TupleEntry(["b", 2], None, 2))
@@ -505,9 +519,9 @@ class TestTupleStoreHeadIndex:
         entry = store.find_match(tmpl)
 
         assert entry.data == ["b", 2]
-        assert tmpl.match_calls == 2
+        assert tmpl.match_calls == 1
 
-    def test_type_head_falls_back_to_full_scan(self):
+    def test_type_head_uses_later_field_index(self):
         store = TupleStore()
         store.add(TupleEntry(["a", 1], None, 1))
         store.add(TupleEntry(["b", 2], None, 2))
@@ -516,7 +530,49 @@ class TestTupleStoreHeadIndex:
         entry = store.find_match(tmpl)
 
         assert entry.data == ["b", 2]
-        assert tmpl.match_calls == 2
+        assert tmpl.match_calls == 1
+
+    def test_picks_the_smallest_concrete_bucket(self):
+        store = TupleStore()
+        for i in range(50):
+            store.add(TupleEntry(["task", "research", i], None, i + 1))
+        store.add(TupleEntry(["task", "critique", 0], None, 51))
+
+        tmpl = CountingTemplate(("task", "critique", WILDCARD))
+        entry = store.find_match(tmpl)
+
+        assert entry.data == ["task", "critique", 0]
+        assert tmpl.match_calls == 1
+
+    def test_intersects_posting_lists_across_fields(self):
+        """Two equality constraints must not scan extras that match only one.
+
+        Head "task" has 100 rows, field 2 value 42 has 2 rows (one task, one
+        other). Intersection is the single tuple that has both.
+        """
+        store = TupleStore()
+        for i in range(100):
+            store.add(TupleEntry(["task", "research", i], None, i + 1))
+            store.add(TupleEntry(["other", "research", i], None, 200 + i))
+
+        tmpl = CountingTemplate(("task", "research", 42))
+        entry = store.find_match(tmpl)
+
+        assert entry is not None
+        assert entry.data == ["task", "research", 42]
+        assert tmpl.match_calls == 1
+
+    def test_intersection_preserves_insertion_order(self):
+        store = TupleStore()
+        store.add(TupleEntry(["task", "research", 1], None, 1))
+        store.add(TupleEntry(["task", "critique", 1], None, 2))
+        store.add(TupleEntry(["task", "research", 1], None, 3))
+
+        tmpl = CountingTemplate(("task", "research", 1))
+        first = store.find_match(tmpl)
+        assert first.entry_id == 1
+        all_ids = [e.entry_id for e in store.find_all(tmpl)]
+        assert all_ids == [1, 3]
 
     def test_remove_drops_entry_from_bucket(self):
         store = TupleStore()
@@ -546,10 +602,13 @@ class TestTupleStoreHeadIndex:
         store.add(nested)
         store.add(tagged)
 
-        # Unhashable head isn't in the index, but wildcard-head lookups still find it
+        # Unhashable head isn't in the position-0 index.
         assert list(store._by_head.keys()) == ["tag"]
         assert list(store._by_head["tag"].values()) == [tagged]
-        assert store.find_match(Template((WILDCARD, 1))).data == [["nested"], 1]
+        # Position 1 is still indexed, so (WILDCARD, 1) does not full-scan.
+        tmpl = CountingTemplate((WILDCARD, 1))
+        assert store.find_match(tmpl).data == [["nested"], 1]
+        assert tmpl.match_calls == 1
 
 
 class TestTupleStoreInternals:
@@ -637,7 +696,7 @@ class TestWaiterIndex:
             loop.close()
 
     def test_concrete_head_waiters_go_into_their_bucket(self):
-        from tuplespace.server import TupleSpaceServer, _OTHER
+        from tuplespace.server import TupleSpaceServer
 
         async def go():
             srv = TupleSpaceServer()
@@ -647,7 +706,10 @@ class TestWaiterIndex:
             srv._add_waiter(Template(()), loop.create_future(), is_take=False)
             assert "task" in srv._waiters_by_head
             assert len(srv._waiters_by_head["task"]) == 1
-            assert len(srv._waiters_other) == 2  # wildcard-head + empty pattern
+            # Second-field waiter is indexed at position 1, not dumped in other.
+            assert 1 in srv._waiters_by_pos[1]
+            assert len(srv._waiters_by_pos[1][1]) == 1
+            assert len(srv._waiters_other) == 1  # empty pattern only
 
         self._run(go())
 
@@ -716,7 +778,7 @@ class TestWaiterIndex:
         self._run(go())
 
     def test_other_bucket_waiters_also_wake(self):
-        """Wildcard-head waiters live in `_other` and must wake on any write."""
+        """Waiters with no concrete field live in `_other` and wake on any write."""
         from tuplespace.server import TupleSpaceServer
 
         async def go():
@@ -725,11 +787,46 @@ class TestWaiterIndex:
             srv._entry_counter = 0
 
             fut = loop.create_future()
-            srv._add_waiter(Template((WILDCARD, 1)), fut, is_take=False)
+            srv._add_waiter(Template((WILDCARD, int)), fut, is_take=False)
 
             await srv._handle_write({"tuple": ["anything", 1], "sec": None})
             assert fut.done()
             assert await fut == ["anything", 1]
+
+        self._run(go())
+
+    def test_wake_uses_later_field_bucket(self):
+        """A write must not iterate waiters whose later field cannot match."""
+        from tuplespace.server import TupleSpaceServer
+
+        async def go():
+            srv = TupleSpaceServer()
+            loop = asyncio.get_running_loop()
+            srv._entry_counter = 0
+
+            class TrackingTemplate(Template):
+                def __init__(self, pattern):
+                    super().__init__(pattern)
+                    self.calls = 0
+
+                def matches(self, data):
+                    self.calls += 1
+                    return super().matches(data)
+
+            noise = [TrackingTemplate((WILDCARD, "noise")) for _ in range(1000)]
+            for t in noise:
+                srv._add_waiter(t, loop.create_future(), is_take=True)
+
+            real = TrackingTemplate((WILDCARD, "target"))
+            fut = loop.create_future()
+            srv._add_waiter(real, fut, is_take=False)
+
+            await srv._handle_write({"tuple": ["job", "target"], "sec": None})
+
+            assert fut.done()
+            assert await fut == ["job", "target"]
+            assert real.calls == 1
+            assert all(t.calls == 0 for t in noise)
 
         self._run(go())
 
