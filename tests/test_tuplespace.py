@@ -216,6 +216,22 @@ class TestBlockingOperations:
         assert result is None
         assert 0.4 < elapsed < 1.5
 
+    def test_timeout_leaves_connection_usable(self, client):
+        """A timed-out blocking take/read must not poison the socket.
+
+        The disconnect watch (reader.read(1)) has to be fully cancelled
+        before the handler reads the next frame. Otherwise the next
+        request dies with StreamReader's two-waiters error and the
+        client sees Connection reset / Broken pipe.
+        """
+        assert client.take(("missing",), sec=0.3) is None
+        client.write(("after-timeout", 1))
+        assert client.take(("after-timeout", WILDCARD), sec=0) == ("after-timeout", 1)
+
+        assert client.read(("still-missing",), sec=0.3) is None
+        client.write(("after-timeout", 2))
+        assert client.read(("after-timeout", 2), sec=0) == ("after-timeout", 2)
+
     def test_default_blocks_forever(self, server, server_port):
         """sec=None (the default) should block until a tuple appears."""
         result_holder = [None]

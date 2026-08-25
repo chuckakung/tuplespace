@@ -31,6 +31,35 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 _SHUTDOWN_HANDLER_TIMEOUT = 5.0
 
 
+async def _release_reader_watch(watch: Optional[asyncio.Future]) -> None:
+    """Cancel the disconnect watch and wait until StreamReader is free.
+
+    ``StreamReader`` allows only one waiter. ``Task.cancel()`` of
+    ``reader.read(1)`` is not enough: the cancelled coroutine is still the
+    waiter until it is awaited, and the next ``readexactly`` on that stream
+    then crashes the handler.
+    """
+    if watch is None:
+        return
+    if not watch.done():
+        watch.cancel()
+    try:
+        await watch
+    except asyncio.CancelledError:
+        # Re-raise only if *this* task is being cancelled (3.11+). On 3.10
+        # there is no cancelling() count; swallowing here is the cancelled
+        # watch, and a parent CancelledError from the wait() above still
+        # propagates out of _wait_for_match's finally.
+        current = asyncio.current_task()
+        cancelling = getattr(current, "cancelling", None) if current is not None else None
+        if cancelling is not None and cancelling():
+            raise
+    except Exception:
+        # EOF, reset, or a stray byte -- peer_done is computed from the
+        # watch's terminal state by the caller.
+        pass
+
+
 class FrameTooLarge(Exception):
     """A peer declared a frame larger than MAX_FRAME_BYTES."""
 
@@ -496,6 +525,12 @@ class TupleSpaceServer:
         connection is done -- for a violation, because the byte just consumed
         would otherwise desync the next frame -- and the waiter must not be
         allowed to consume a tuple.
+
+        The disconnect watch must be fully drained before this returns. A
+        cancelled ``reader.read(1)`` that is not awaited stays registered as
+        the StreamReader waiter, and the handler's next ``readexactly`` then
+        raises ``RuntimeError: readexactly() called while another coroutine
+        is already waiting for incoming data``.
         """
         future = waiter.future
         watch = asyncio.ensure_future(reader.read(1)) if reader is not None else None
@@ -507,8 +542,7 @@ class TupleSpaceServer:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            if watch is not None:
-                watch.cancel()
+            await _release_reader_watch(watch)
 
         # Any completed watch means the stream is finished or out of sync.
         peer_done = watch is not None and watch.done() and not watch.cancelled()
