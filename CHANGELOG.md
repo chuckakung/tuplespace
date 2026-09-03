@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-03
+
 ### Added
 
 - ``update(template, tuple, sec=None, expire=None)`` replaces the first
@@ -39,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - ``_admit`` is a plain ``def``, not a coroutine. Add-then-wake must not
   yield; an ``await`` in that body is now a syntax error.
+
+### Removed
+
+- ``migrate_db.py``, the pre-0.1.0 pickle-to-JSON one-shot. JSON has been the
+  on-disk format since the first release.
 
 ## [0.4.0] - 2026-08-16
 
@@ -209,6 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Examples: producer/consumer over TCP.
 - GitHub Actions workflow running pytest on Python 3.10, 3.11, 3.12.
 
+[0.5.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.5.0
 [0.4.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.4.0
 [0.3.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.3.0
 [0.2.0]: https://github.com/chuckakung/tuplespace/releases/tag/v0.2.0
